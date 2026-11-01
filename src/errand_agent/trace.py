@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Callable
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -62,6 +63,16 @@ class Tracer:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.store = store
         self.clock = clock
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
+
+    def add_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        """Register a sink for each trace record, such as the web event stream."""
+        if listener not in self._listeners:
+            self._listeners.append(listener)
+
+    def remove_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        if listener in self._listeners:
+            self._listeners.remove(listener)
 
     def path_for(self, run_id: str) -> Path:
         return self.base_dir / f"{run_id}.jsonl"
@@ -96,4 +107,10 @@ class Tracer:
             json.dumps(clean_payload, ensure_ascii=False),
             latency_ms,
         )
+        for listener in tuple(self._listeners):
+            try:
+                listener(record)
+            except Exception:
+                # A presentation sink must never break the audit trail.
+                pass
         return record

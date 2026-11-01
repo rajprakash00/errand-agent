@@ -5,88 +5,24 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-from errand_agent.budget import BudgetCaps, BudgetKeeper
-from errand_agent.clock import IST, Clock, FakeClock, SystemClock
-from errand_agent.conversation import Conversation
-from errand_agent.db import Store
-from errand_agent.formatting import format_price, format_slot, format_slot_range
-from errand_agent.guard import ExecutionGuard
-from errand_agent.model import ScriptedModel
-from errand_agent.models import (
-    FactStatus,
-    MemoryFact,
-    MemoryKey,
-    RequiredSlot,
-    RunState,
-    TurnResult,
+from errand_agent.application import (
+    FAULT_SCENARIOS,
+    WEB_SCENARIOS,
+    App,
+    apply_demo_fault,
+    build_app,
+    format_memory_fact,
+    restart_app,
+    seed_demo_booking,
 )
-from errand_agent.runtime import Runtime
-from errand_agent.toolbox import Toolbox
-from errand_agent.trace import Tracer
-from errand_agent.world import HOLD_MINUTES, MockProviderWorld, ProcessCrash
-
-
-@dataclass
-class App:
-    store: Store
-    world: MockProviderWorld
-    tracer: Tracer
-    conversation: Conversation
-    clock: Clock
-    budget: BudgetKeeper
-
-    def close(self) -> None:
-        self.store.close()
-
-
-def build_app(
-    data_dir: str | Path,
-    *,
-    clock: Clock | None = None,
-    user_id: str = "user_raj",
-    caps: BudgetCaps | None = None,
-) -> App:
-    resolved_clock = clock or SystemClock()
-    path = Path(data_dir)
-    store = Store(path / "errand.db")
-    tracer = Tracer(path / "traces", store, resolved_clock)
-    world = MockProviderWorld(resolved_clock, user_id=user_id)
-    model = ScriptedModel()
-    runtime = Runtime(store, tracer, resolved_clock)
-    budget = BudgetKeeper(store, resolved_clock, caps)
-    toolbox = Toolbox(world, tracer, resolved_clock, budget)
-    guard = ExecutionGuard(store, toolbox, runtime, resolved_clock)
-    conversation = Conversation(
-        store,
-        world,
-        tracer,
-        resolved_clock,
-        model,
-        runtime=runtime,
-        toolbox=toolbox,
-        guard=guard,
-        budget=budget,
-    )
-    return App(
-        store=store,
-        world=world,
-        tracer=tracer,
-        conversation=conversation,
-        clock=resolved_clock,
-        budget=budget,
-    )
-
-
-def format_memory_fact(fact: MemoryFact) -> str:
-    value = fact.value if fact.value is not None else "(forgotten)"
-    return (
-        f"{fact.key.value} = {value} "
-        f"({fact.provenance.value}, {fact.status.value})"
-    )
+from errand_agent.budget import BudgetCaps
+from errand_agent.clock import IST, FakeClock
+from errand_agent.formatting import format_slot
+from errand_agent.models import FactStatus, MemoryKey, RequiredSlot, RunState, TurnResult
+from errand_agent.world import ProcessCrash
 
 
 def print_turn(user_text: str, turn: TurnResult) -> None:
@@ -99,121 +35,6 @@ def print_turn(user_text: str, turn: TurnResult) -> None:
     for fact in turn.memory:
         print(f"[memory] {format_memory_fact(fact)}")
     print(f"[state: {turn.state.value}]")
-
-
-def restart_app(app: App, data_dir: str | Path, user_id: str) -> App:
-    """Rebuild the kernel over the same database, as a process restart would.
-
-    The mock provider world stays alive because it models an external provider;
-    the agent's store, runtime, guard, and conversation are rebuilt.
-    """
-    app.store.close()
-    path = Path(data_dir)
-    store = Store(path / "errand.db")
-    tracer = Tracer(path / "traces", store, app.clock)
-    runtime = Runtime(store, tracer, app.clock)
-    budget = BudgetKeeper(store, app.clock, app.budget.caps)
-    toolbox = Toolbox(app.world, tracer, app.clock, budget)
-    guard = ExecutionGuard(store, toolbox, runtime, app.clock)
-    conversation = Conversation(
-        store,
-        app.world,
-        tracer,
-        app.clock,
-        ScriptedModel(),
-        runtime=runtime,
-        toolbox=toolbox,
-        guard=guard,
-        budget=budget,
-    )
-    return App(
-        store=store,
-        world=app.world,
-        tracer=tracer,
-        conversation=conversation,
-        clock=app.clock,
-        budget=budget,
-    )
-
-
-def seed_demo_booking(app: App, user_id: str) -> None:
-    """Seed one future booking for the cancel and reschedule demos."""
-    now = app.clock.now()
-    results = app.world.search_providers("plumber", "Indiranagar", (now, now + timedelta(days=7)))
-    if not results:
-        raise RuntimeError("no provider slots are available to seed a booking")
-    # Prefer a provider with spare slots so the reschedule-conflict demo has a
-    # replacement to offer after the configured conflict.
-    first = max(results, key=lambda result: len(result.free_slots))
-    slot = first.free_slots[0]
-    app.world.seed_booking(first.provider_id, slot, user_id=user_id)
-    print(
-        f"\n[demo] Seeded an existing booking: {first.name} — "
-        f"{format_slot_range(slot, slot + timedelta(minutes=60))}."
-    )
-
-
-def apply_demo_fault(app: App, scenario: str, turn: TurnResult, clock: FakeClock | None) -> None:
-    """Inject the deterministic fault for a demo scenario after the approval card."""
-    assert turn.approval is not None
-    proposal = app.store.require_proposal(turn.approval.proposal_id)
-    if scenario == "quote-change":
-        if proposal.hold_id is None:
-            raise RuntimeError("the quote-change scenario needs a booking hold")
-        new_price = proposal.quoted_price_inr + 100
-        app.world.requote_hold(proposal.hold_id, price_inr=new_price)
-        print(
-            "\n[scenario] The provider re-quoted the hold after approval: "
-            f"{format_price(proposal.quoted_price_inr)} -> {format_price(new_price)}."
-        )
-    elif scenario == "slot-change":
-        if proposal.hold_id is None:
-            raise RuntimeError("the slot-change scenario needs a booking hold")
-        run = app.store.require_run(turn.run_id)
-        option = next(item for item in run.options if item.provider_id == proposal.provider_id)
-        new_start = next(slot for slot in option.free_slots if slot != proposal.slot_start)
-        new_end = new_start + (proposal.slot_end - proposal.slot_start)
-        app.world.requote_hold(proposal.hold_id, slot_start=new_start, slot_end=new_end)
-        print(
-            "\n[scenario] The provider moved the hold after approval: "
-            f"{format_slot_range(proposal.slot_start, proposal.slot_end)} -> "
-            f"{format_slot_range(new_start, new_end)}."
-        )
-    elif scenario == "hold-expiry":
-        if clock is None:
-            raise RuntimeError("the hold-expiry scenario needs the fake clock")
-        clock.advance(minutes=HOLD_MINUTES + 1)
-        print("\n[scenario] Time passes beyond the 10-minute hold expiry.")
-    elif scenario == "timeout-after-success":
-        app.world.fail_next_book(committed=True)
-        print("\n[scenario] The booking call times out after the provider committed.")
-    elif scenario == "timeout-before-success":
-        app.world.fail_next_book(committed=False)
-        print("\n[scenario] The booking call times out before the provider committed.")
-    elif scenario == "restart-mid-booking":
-        app.world.crash_next_book(committed=False)
-        print("\n[scenario] The agent process will die mid-booking.")
-    elif scenario == "reschedule-conflict":
-        app.world.configure_reschedule_conflict(proposal.provider_id, proposal.slot_start)
-        print(
-            "\n[scenario] The provider will reject the approved slot "
-            f"{format_slot_range(proposal.slot_start, proposal.slot_end)}."
-        )
-    else:
-        raise ValueError(f"unknown demo scenario: {scenario}")
-
-
-FAULT_SCENARIOS = frozenset(
-    {
-        "quote-change",
-        "slot-change",
-        "hold-expiry",
-        "timeout-after-success",
-        "timeout-before-success",
-        "restart-mid-booking",
-        "reschedule-conflict",
-    }
-)
 
 
 def run_demo(args: argparse.Namespace) -> int:
@@ -229,7 +50,7 @@ def run_demo(args: argparse.Namespace) -> int:
         print(f"User: {args.user_id}")
 
         if args.scenario in {"cancel", "reschedule-conflict"}:
-            seed_demo_booking(app, args.user_id)
+            print(f"\n{seed_demo_booking(app, args.user_id)}")
         if args.scenario == "unknown-error":
             app.world.fail_next_search()
 
@@ -256,7 +77,7 @@ def run_demo(args: argparse.Namespace) -> int:
                 reply = slot_replies[turn.requested_slot]
             elif turn.approval is not None:
                 if not injected:
-                    apply_demo_fault(app, args.scenario, turn, demo_clock)
+                    print(f"\n{apply_demo_fault(app, args.scenario, turn, demo_clock)}")
                     injected = True
                 reply = "yes"
             elif turn.options:
@@ -326,6 +147,20 @@ def run_chat(args: argparse.Namespace) -> int:
         return 0
     finally:
         app.close()
+
+
+def run_serve(args: argparse.Namespace) -> int:
+    from errand_agent.web import serve
+
+    print(f"Errand Agent web UI — scenario: {args.scenario}")
+    serve(
+        args.data_dir,
+        host=args.host,
+        port=args.port,
+        user_id=args.user_id,
+        scenario=args.scenario,
+    )
+    return 0
 
 
 def print_memory(app: App, user_id: str, *, include_forgotten: bool = False) -> None:
@@ -537,6 +372,19 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--data-dir", default=".errand")
     chat.add_argument("--user-id", default="user_raj")
     chat.set_defaults(handler=run_chat)
+
+    web = subparsers.add_parser("serve", help="start the browser chat and live trace")
+    web.add_argument("--data-dir", default=".errand")
+    web.add_argument("--user-id", default="user_raj")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8000)
+    web.add_argument(
+        "--scenario",
+        choices=sorted(WEB_SCENARIOS),
+        default="happy",
+        help="demo scenario or fault for the browser UI",
+    )
+    web.set_defaults(handler=run_serve)
 
     memory = subparsers.add_parser("memory", help="view and manage saved preferences")
     memory.add_argument("--data-dir", default=".errand")
