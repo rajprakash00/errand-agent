@@ -39,6 +39,10 @@ class ApprovalInvalid(ApprovalError):
     pass
 
 
+class ProposalChanged(ApprovalInvalid):
+    """The stored proposal no longer matches the hash the user approved."""
+
+
 class ApprovalExpired(ApprovalError):
     pass
 
@@ -97,11 +101,21 @@ def record_approval(
     now = clock.now()
     if now >= proposal.expires_at:
         store.update_proposal_state(proposal.id, ProposalState.EXPIRED, now)
+        runtime.trace(
+            proposal.run_id,
+            "approval_decided",
+            {
+                "decision": "expired",
+                "proposal_id": proposal.id,
+                "reason": "hold_expired",
+                "expires_at": proposal.expires_at,
+            },
+        )
         raise ApprovalExpired("the hold expired before approval")
 
     computed = compute_binding_hash(proposal)
     if computed != proposal.binding_hash:
-        raise ApprovalInvalid("proposal binding hash does not match its fields")
+        raise ProposalChanged("proposal binding hash does not match its fields")
 
     existing = store.get_approval_for_proposal(proposal.id)
     if existing is not None:

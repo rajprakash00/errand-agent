@@ -17,6 +17,7 @@ from errand_agent.approval import (
     ApprovalExpired,
     ApprovalInvalid,
     ApprovalRequired,
+    ProposalChanged,
     compute_binding_hash,
 )
 from errand_agent.clock import Clock
@@ -35,11 +36,20 @@ from errand_agent.models import (
 )
 from errand_agent.runtime import Runtime
 from errand_agent.toolbox import Toolbox
-from errand_agent.world import HoldExpired, SlotTaken
+from errand_agent.world import Hold, HoldExpired, SlotTaken
 
 
 class ExecutionFailed(Exception):
     pass
+
+
+class QuoteChanged(ApprovalInvalid):
+    """The provider's live hold no longer matches the approved proposal."""
+
+    def __init__(self, hold: Hold, reason: str) -> None:
+        super().__init__(f"the provider quote changed after approval: {reason}")
+        self.hold = hold
+        self.reason = reason
 
 
 class VerificationFailed(Exception):
@@ -62,6 +72,28 @@ def idempotency_key(proposal: Proposal) -> str:
     """Stable across retries and restarts; derived only from the proposal and action."""
     raw = f"{proposal.id}:{proposal.action.value}".encode()
     return hashlib.sha256(raw).hexdigest()[:40]
+
+
+def _same_second(left: datetime, right: datetime) -> bool:
+    """Persisted proposals keep whole seconds, so compare at that precision."""
+    return left.replace(microsecond=0) == right.replace(microsecond=0)
+
+
+def quote_change_reason(proposal: Proposal, hold: Hold) -> str | None:
+    """Name the first binding field the live hold no longer matches."""
+    if hold.provider_id != proposal.provider_id:
+        return "provider_changed"
+    if not _same_second(hold.slot_start, proposal.slot_start) or not _same_second(
+        hold.slot_end, proposal.slot_end
+    ):
+        return "slot_changed"
+    if hold.quoted_price_inr != proposal.quoted_price_inr:
+        return "price_changed"
+    if hold.quote_version != proposal.quote_version:
+        return "quote_version_changed"
+    if not _same_second(hold.expires_at, proposal.expires_at):
+        return "expiry_changed"
+    return None
 
 
 class ExecutionGuard:
@@ -112,7 +144,7 @@ class ExecutionGuard:
         computed = compute_binding_hash(proposal)
         if computed != proposal.binding_hash or approval.binding_hash != proposal.binding_hash:
             self._void(proposal, approval, now, "binding_hash_mismatch")
-            raise ApprovalInvalid("the proposal changed after approval")
+            raise ProposalChanged("the proposal changed after approval")
 
         if approval.state != ApprovalState.RECORDED:
             raise ApprovalRequired("the approval is not in a recorded state")
@@ -125,6 +157,18 @@ class ExecutionGuard:
         if now >= proposal.expires_at or now >= hold.expires_at:
             self._void(proposal, approval, now, "hold_expired")
             raise ApprovalExpired("the hold expired before execution")
+
+        world_hold = self.toolbox.world.get_hold(proposal.hold_id)
+        if world_hold is None:
+            self._void(proposal, approval, now, "hold_missing")
+            raise ApprovalExpired("the provider no longer has this hold")
+        if now >= world_hold.expires_at:
+            self._void(proposal, approval, now, "hold_expired")
+            raise ApprovalExpired("the provider hold expired before execution")
+        reason = quote_change_reason(proposal, world_hold)
+        if reason is not None:
+            self._void(proposal, approval, now, reason)
+            raise QuoteChanged(world_hold, reason)
 
         run = self.store.require_run(proposal.run_id)
         if run.state != RunState.AWAITING_APPROVAL:

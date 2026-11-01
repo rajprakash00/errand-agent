@@ -494,6 +494,7 @@ class MockProviderWorld:
         self._rng = random.Random(seed)
         self._holds: dict[str, Hold] = {}
         self._held_slots: dict[tuple[str, datetime], datetime] = {}
+        self._quote_overrides: dict[tuple[str, datetime], tuple[int, int]] = {}
         self._booked_slots: set[tuple[str, datetime]] = set()
         self._bookings_by_key: dict[str, WorldBooking] = {}
         self._bookings: list[WorldBooking] = []
@@ -657,6 +658,9 @@ class MockProviderWorld:
             available = self._free_slots(provider, (slot_start, slot_end + timedelta(minutes=1)))
             if slot_start not in available:
                 raise SlotUnavailable("slot is not available")
+            quoted_price, quote_version = self._quote_overrides.get(
+                (provider.id, slot_start), (provider.price_inr, 1)
+            )
             hold = Hold(
                 id=new_id("hold"),
                 user_id=self.user_id,
@@ -664,8 +668,8 @@ class MockProviderWorld:
                 provider_name=provider.name,
                 slot_start=slot_start,
                 slot_end=slot_end,
-                quoted_price_inr=provider.price_inr,
-                quote_version=1,
+                quoted_price_inr=quoted_price,
+                quote_version=quote_version,
                 expires_at=now + timedelta(minutes=HOLD_MINUTES),
             )
             self._holds[hold.id] = hold
@@ -681,6 +685,70 @@ class MockProviderWorld:
         hold = self._holds.pop(hold_id, None)
         if hold is not None:
             self._held_slots.pop((hold.provider_id, hold.slot_start), None)
+
+    def get_hold(self, hold_id: str) -> Hold | None:
+        """Read the live quote for kernel validation. Not a model tool.
+
+        This is not part of the fixed provider contract. The guard uses it only
+        to detect a provider-side change between approval and execution.
+        """
+        return self._holds.get(hold_id)
+
+    def requote_hold(
+        self,
+        hold_id: str,
+        *,
+        price_inr: int | None = None,
+        slot_start: datetime | None = None,
+        slot_end: datetime | None = None,
+    ) -> Hold:
+        """Change a live hold's quote or slot. A deterministic fault control.
+
+        Not a model tool. The next hold for the resulting provider and slot
+        carries the new quote, so a re-hold after invalidation sees it too.
+        """
+        args: dict[str, Any] = {"hold_id": hold_id, "price_inr": price_inr}
+        if slot_start is not None:
+            args["slot_start"] = slot_start
+        if slot_end is not None:
+            args["slot_end"] = slot_end
+        try:
+            hold = self._holds.get(hold_id)
+            if hold is None:
+                raise WorldError(f"unknown hold: {hold_id}")
+            if self._now() >= hold.expires_at:
+                raise HoldExpired("cannot re-quote an expired hold")
+
+            new_start = hold.slot_start if slot_start is None else slot_start
+            if slot_end is not None:
+                new_end = slot_end
+            elif slot_start is not None:
+                new_end = new_start + (hold.slot_end - hold.slot_start)
+            else:
+                new_end = hold.slot_end
+            if new_end - new_start != hold.slot_end - hold.slot_start:
+                raise WorldError("a re-quote must keep the slot length")
+
+            if new_start != hold.slot_start:
+                if not self._slot_available(hold.provider_id, new_start):
+                    raise SlotUnavailable("the new slot is not available")
+                self._held_slots.pop((hold.provider_id, hold.slot_start), None)
+
+            hold.slot_start = new_start
+            hold.slot_end = new_end
+            if price_inr is not None:
+                hold.quoted_price_inr = price_inr
+            hold.quote_version += 1
+            self._held_slots[(hold.provider_id, new_start)] = hold.expires_at
+            self._quote_overrides[(hold.provider_id, new_start)] = (
+                hold.quoted_price_inr,
+                hold.quote_version,
+            )
+            self._record("requote_hold", args, result=hold)
+            return hold
+        except Exception as exc:
+            self._record("requote_hold", args, error=str(exc))
+            raise
 
     def book(self, hold_id: str, idempotency_key: str) -> WorldBooking:
         args = {"hold_id": hold_id, "idempotency_key": idempotency_key}
