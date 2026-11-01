@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from errand_agent.approval import (
     ApprovalConsumed,
     ApprovalExpired,
     ApprovalInvalid,
     ApprovalRequired,
+    ProposalChanged,
     compute_binding_hash,
     record_approval,
 )
@@ -26,6 +27,7 @@ from errand_agent.guard import (
     ExecutionFailed,
     ExecutionGuard,
     ExecutionInProgress,
+    QuoteChanged,
     VerificationFailed,
 )
 from errand_agent.ids import new_id
@@ -47,7 +49,7 @@ from errand_agent.models import (
 from errand_agent.runtime import Runtime
 from errand_agent.toolbox import Toolbox
 from errand_agent.trace import Tracer
-from errand_agent.world import MockProviderWorld, SlotUnavailable
+from errand_agent.world import Hold, MockProviderWorld, SlotUnavailable
 
 SLOT_LENGTH = timedelta(minutes=60)
 
@@ -93,6 +95,19 @@ class Conversation:
     def send_message(self, run_id: str, text: str) -> TurnResult:
         run = self.store.require_run(run_id)
         if is_terminal(run.state):
+            latest = self.store.get_latest_proposal_for_run(run_id)
+            booking = self.store.get_booking_by_proposal(latest.id) if latest is not None else None
+            if booking is not None:
+                # A repeated confirmation after completion returns the existing
+                # booking. It never writes an approval or calls book again.
+                message = self.model.draft(
+                    DraftRequest(
+                        kind="already_booked",
+                        data={"booking": booking, "trace_path": run.trace_path},
+                    )
+                )
+                self.runtime.assistant_message(run_id, message)
+                return self._turn(run_id, [message], booking=booking)
             message = "This errand is already finished. Start a new errand."
             self.runtime.assistant_message(run_id, message)
             return self._turn(run_id, [message])
@@ -235,12 +250,33 @@ class Conversation:
         slot_start = min(option.free_slots)
         slot_end = slot_start + SLOT_LENGTH
         self.runtime.transition(run_id, RunState.HOLDING, reason="provider selected")
+        return self._hold_and_request_approval(
+            run_id,
+            provider_id=option.provider_id,
+            slot_start=slot_start,
+            slot_end=slot_end,
+            draft_kind="approval",
+            options=options,
+        )
 
+    def _hold_and_request_approval(
+        self,
+        run_id: str,
+        *,
+        provider_id: str,
+        slot_start: datetime,
+        slot_end: datetime,
+        draft_kind: str,
+        options: list[ProviderOption],
+        draft_extra: dict[str, object] | None = None,
+        supersedes: Proposal | None = None,
+    ) -> TurnResult:
+        run = self.store.require_run(run_id)
         try:
             hold = self.toolbox.call(
                 run_id,
                 "hold_slot",
-                provider_id=option.provider_id,
+                provider_id=provider_id,
                 slot_start=slot_start,
                 slot_end=slot_end,
             )
@@ -303,24 +339,25 @@ class Conversation:
             expires_at=proposal.expires_at,
             binding_hash=proposal.binding_hash,
         )
-        self.runtime.trace(
-            run_id,
-            "approval_requested",
-            {
-                "proposal_id": proposal.id,
-                "hold_id": hold.id,
-                "action": proposal.action.value,
-                "provider_id": proposal.provider_id,
-                "provider_name": hold.provider_name,
-                "slot_start": proposal.slot_start,
-                "slot_end": proposal.slot_end,
-                "quoted_price_inr": proposal.quoted_price_inr,
-                "quote_version": proposal.quote_version,
-                "expires_at": proposal.expires_at,
-                "binding_hash": proposal.binding_hash,
-            },
-        )
-        message = self._draft(run_id, "approval", {"card": card})
+        trace_payload: dict[str, object] = {
+            "proposal_id": proposal.id,
+            "hold_id": hold.id,
+            "action": proposal.action.value,
+            "provider_id": proposal.provider_id,
+            "provider_name": hold.provider_name,
+            "slot_start": proposal.slot_start,
+            "slot_end": proposal.slot_end,
+            "quoted_price_inr": proposal.quoted_price_inr,
+            "quote_version": proposal.quote_version,
+            "expires_at": proposal.expires_at,
+            "binding_hash": proposal.binding_hash,
+        }
+        if supersedes is not None:
+            trace_payload["supersedes_proposal_id"] = supersedes.id
+            trace_payload["reason"] = (draft_extra or {}).get("reason")
+        self.runtime.trace(run_id, "approval_requested", trace_payload)
+
+        message = self._draft(run_id, draft_kind, {"card": card, **(draft_extra or {})})
         self.runtime.assistant_message(run_id, message)
         return self._turn(run_id, [message], options=options, approval=card)
 
@@ -386,6 +423,49 @@ class Conversation:
         self.store.update_hold_state(proposal.hold_id, "released")
         self.runtime.transition(run_id, RunState.OPTIONS_READY, reason="approval declined")
 
+    def _rehold_after_invalidation(
+        self,
+        run_id: str,
+        old_proposal: Proposal,
+        reason: str,
+        quote: Hold | None,
+    ) -> TurnResult:
+        """Replace a void or expired proposal with a fresh hold and approval.
+
+        Price and slot changes use the provider's live quote. An expired hold is
+        re-held at the same slot. No booking call happens before the new approval.
+        """
+        run = self.store.require_run(run_id)
+        self.runtime.transition(
+            run_id,
+            RunState.OPTIONS_READY,
+            reason=f"approval invalidated: {reason}",
+        )
+        self.world.release_hold(old_proposal.hold_id)
+        self.store.update_hold_state(
+            old_proposal.hold_id,
+            "expired" if reason == "hold_expired" else "released",
+        )
+        provider_id = quote.provider_id if quote is not None else old_proposal.provider_id
+        slot_start = quote.slot_start if quote is not None else old_proposal.slot_start
+        slot_end = quote.slot_end if quote is not None else old_proposal.slot_end
+        self.runtime.transition(run_id, RunState.HOLDING, reason=f"re-hold after {reason}")
+        return self._hold_and_request_approval(
+            run_id,
+            provider_id=provider_id,
+            slot_start=slot_start,
+            slot_end=slot_end,
+            draft_kind="reapproval",
+            options=run.options,
+            draft_extra={
+                "reason": reason,
+                "old_price_inr": old_proposal.quoted_price_inr,
+                "old_slot_start": old_proposal.slot_start,
+                "old_slot_end": old_proposal.slot_end,
+            },
+            supersedes=old_proposal,
+        )
+
     def _execute_approval(self, run_id: str, proposal: Proposal) -> TurnResult:
         run = self.store.require_run(run_id)
         try:
@@ -393,6 +473,12 @@ class Conversation:
                 self.store, self.runtime, self.clock, proposal.id, run.user_id
             )
             result = self.guard.execute_book(proposal.id, approval.id)
+        except QuoteChanged as exc:
+            return self._rehold_after_invalidation(run_id, proposal, exc.reason, exc.hold)
+        except ApprovalExpired:
+            return self._rehold_after_invalidation(run_id, proposal, "hold_expired", None)
+        except ProposalChanged:
+            return self._rehold_after_invalidation(run_id, proposal, "proposal_changed", None)
         except ApprovalConsumed:
             booking = self.store.get_booking_by_proposal(proposal.id)
             if booking is not None:
@@ -422,7 +508,7 @@ class Conversation:
             message = self._draft(run_id, "approval_required", {"trace_path": run.trace_path})
             self.runtime.assistant_message(run_id, message)
             return self._turn(run_id, [message])
-        except (ApprovalExpired, ApprovalInvalid) as exc:
+        except ApprovalInvalid as exc:
             message = self._draft(
                 run_id, "failed", {"reason": str(exc), "trace_path": run.trace_path}
             )

@@ -19,3 +19,25 @@ the check for creating a new hold.
 
 **Regression:** `tests/test_happy_path.py::test_happy_path_books_once_and_verifies`
 drives the full path and asserts exactly one booking and a verified status call.
+
+## 2. Sub-second clock precision voided every real approval
+
+**Found:** while running `uv run errand demo` during ticket 02.
+
+**Symptom:** With the wall clock, the first typed `yes` was refused with
+"the provider quote changed after your approval". The agent re-held and showed
+an identical approval card forever. Tests passed because the fake clock used
+whole seconds.
+
+**Cause:** `proposals.expires_at` is persisted with `timespec="seconds"`, but
+the live hold kept the microseconds from `SystemClock`. The new live-quote
+check compared the two `datetime` values directly, so the expiry always looked
+different and the approval was always voided. The binding hash already
+canonicalises timestamps to whole seconds.
+
+**Fix:** The guard compares binding timestamps at whole-second precision
+(`_same_second`), matching the persistence and hash precision.
+
+**Regression:** `tests/test_approval_invalidation.py::test_approval_survives_sub_second_clock_precision`
+sets a microsecond clock and asserts the first confirmation completes with one
+booking.

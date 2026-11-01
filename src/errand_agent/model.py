@@ -196,6 +196,8 @@ class ScriptedModel:
             )
         if request.kind == "approval":
             return self._draft_approval(data["card"])
+        if request.kind == "reapproval":
+            return self._draft_reapproval(data)
         if request.kind == "booked":
             return self._draft_booked(data["booking"], data["trace_path"])
         if request.kind == "declined":
@@ -257,16 +259,67 @@ class ScriptedModel:
         return "\n".join(lines)
 
     @staticmethod
+    def _approval_lines(card: ApprovalCard) -> list[str]:
+        return [
+            f"Action: {card.action.value}",
+            f"Provider: {card.provider_name} ({card.provider_id})",
+            f"Slot: {format_slot_range(card.slot_start, card.slot_end)}",
+            f"Price: {format_price(card.quoted_price_inr)}",
+            f"Hold expires: {format_expiry(card.expires_at)}",
+        ]
+
+    @staticmethod
     def _draft_approval(card: ApprovalCard) -> str:
         return "\n".join(
             [
                 "I've held the slot. Here is the exact approval:",
                 "",
-                f"Action: {card.action.value}",
-                f"Provider: {card.provider_name} ({card.provider_id})",
-                f"Slot: {format_slot_range(card.slot_start, card.slot_end)}",
-                f"Price: {format_price(card.quoted_price_inr)}",
-                f"Hold expires: {format_expiry(card.expires_at)}",
+                *ScriptedModel._approval_lines(card),
+                "",
+                'Reply "yes" to approve or "no" to decline.',
+            ]
+        )
+
+    @staticmethod
+    def _draft_reapproval(data: dict[str, Any]) -> str:
+        card: ApprovalCard = data["card"]
+        reason = data["reason"]
+        old_start = data.get("old_slot_start")
+        old_end = data.get("old_slot_end")
+        if reason == "hold_expired":
+            intro = (
+                "Your hold expired before the booking, so the old approval is void. "
+                "I held the slot again and got a fresh quote."
+            )
+        elif reason == "price_changed":
+            intro = (
+                "The provider changed the price after your approval, so the old approval is void. "
+                f"The price changed from {format_price(int(data['old_price_inr']))} to "
+                f"{format_price(card.quoted_price_inr)}."
+            )
+        elif reason == "slot_changed":
+            intro = (
+                "The provider changed the slot after your approval, so the old approval is void. "
+                f"The slot changed from {format_slot_range(old_start, old_end)} to "
+                f"{format_slot_range(card.slot_start, card.slot_end)}."
+            )
+        elif reason == "proposal_changed":
+            intro = (
+                "The proposal changed after your approval, so the old approval is void. "
+                "I held the slot again and got a fresh quote."
+            )
+        else:
+            intro = (
+                "The provider quote changed after your approval, so the old approval is void. "
+                "I held the slot again and got a fresh quote."
+            )
+        return "\n".join(
+            [
+                intro,
+                "",
+                "Here is the new exact approval:",
+                "",
+                *ScriptedModel._approval_lines(card),
                 "",
                 'Reply "yes" to approve or "no" to decline.',
             ]
