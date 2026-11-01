@@ -25,14 +25,17 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from errand_agent.application import (
+    DEMO_SCENARIO_BY_KEY,
+    DEMO_SCENARIOS,
     App,
     apply_demo_fault,
     build_app,
+    restart_app,
     scenario_summary,
     seed_demo_booking,
 )
 from errand_agent.budget import BudgetCaps
-from errand_agent.clock import IST, Clock, FakeClock
+from errand_agent.clock import Clock, DemoClock
 from errand_agent.dialogue import is_terminal, parse_confirmation
 from errand_agent.formatting import (
     format_expiry,
@@ -52,6 +55,7 @@ from errand_agent.models import (
     RunState,
     TurnResult,
 )
+from errand_agent.world import ProcessCrash
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
@@ -155,6 +159,7 @@ class WebRuntime:
     app: App
     user_id: str
     scenario: str
+    data_dir: Path
     lock: threading.RLock = field(default_factory=threading.RLock)
     hub: TraceHub = field(default_factory=TraceHub)
     scenario_applied: set[str] = field(default_factory=set)
@@ -165,6 +170,10 @@ class WebRuntime:
 
 class MessageBody(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+
+
+class DemoScenarioBody(BaseModel):
+    scenario: str = Field(min_length=1, max_length=80)
 
 
 class MemoryCorrectionBody(BaseModel):
@@ -433,6 +442,53 @@ def _resolve_memory_key(key: str) -> MemoryKey:
         raise HTTPException(status_code=404, detail="unknown memory key") from exc
 
 
+def _demo_payload(rt: WebRuntime) -> dict[str, Any]:
+    """The debug panel view: the armable catalog and the active scenario."""
+    spec = DEMO_SCENARIO_BY_KEY.get(rt.scenario)
+    return {
+        "scenario": rt.scenario,
+        "label": spec.label if spec is not None else rt.scenario,
+        "summary": scenario_summary(rt.scenario),
+        "active": rt.scenario != "happy",
+        "notice": rt.startup_notice,
+        "scenarios": [
+            {
+                "key": scenario.key,
+                "label": scenario.label,
+                "summary": scenario.summary,
+                "hint": scenario.hint,
+                "prompt": scenario.prompt,
+                "seeds_booking": scenario.seeds_booking,
+            }
+            for scenario in DEMO_SCENARIOS
+        ],
+    }
+
+
+def _arm_scenario(rt: WebRuntime, scenario: str) -> dict[str, Any]:
+    spec = DEMO_SCENARIO_BY_KEY.get(scenario)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="unknown demo scenario")
+    with rt.lock:
+        rt.scenario = scenario
+        rt.scenario_applied.clear()
+        rt.unknown_error_armed = False
+        rt.notices.clear()
+        rt.app.budget.caps = (
+            BudgetCaps(turn_cap=1) if spec.forces_turn_cap else BudgetCaps()
+        )
+        notice: str | None = None
+        if spec.seeds_booking and not rt.app.world.list_bookings(rt.user_id):
+            notice = seed_demo_booking(rt.app, rt.user_id)
+        rt.startup_notice = notice
+        return _demo_payload(rt)
+
+
+def _demo_snapshot_only(rt: WebRuntime) -> dict[str, Any]:
+    with rt.lock:
+        return _demo_payload(rt)
+
+
 def snapshot(rt: WebRuntime, run_id: str) -> dict[str, Any]:
     """One complete, read-only view of a run for the browser."""
     app = rt.app
@@ -516,6 +572,7 @@ def _maybe_inject_fault(rt: WebRuntime, run_id: str, text: str) -> None:
         "hold-expiry",
         "timeout-after-success",
         "timeout-before-success",
+        "restart-mid-booking",
         "reschedule-conflict",
     }:
         return
@@ -551,10 +608,31 @@ def _start(rt: WebRuntime, text: str) -> dict[str, Any]:
         return snapshot(rt, turn.run_id)
 
 
+def _restart_after_crash(rt: WebRuntime) -> None:
+    """Rebuild the kernel over the same database, as a process restart would."""
+    rt.app = restart_app(rt.app, rt.data_dir, rt.user_id)
+    rt.app.tracer.add_listener(rt.hub.publish)
+    if rt.scenario == "limit-turns":
+        rt.app.budget.caps = BudgetCaps(turn_cap=1)
+
+
 def _message(rt: WebRuntime, run_id: str, text: str) -> dict[str, Any]:
     with rt.lock:
         _maybe_inject_fault(rt, run_id, text)
-        turn = rt.app.conversation.send_message(run_id, text)
+        try:
+            turn = rt.app.conversation.send_message(run_id, text)
+        except ProcessCrash:
+            # The demo crash fires after the intent write. Rebuild the kernel
+            # over the same SQLite file and let recovery own the result.
+            _restart_after_crash(rt)
+            recovered = rt.app.conversation.recover_pending()
+            rt.notices[run_id] = (
+                "[scenario] The agent process died mid-booking. It restarted over "
+                "the same database and recovered the in-flight intent."
+            )
+            if not recovered:
+                raise
+            return snapshot(rt, run_id)
         return snapshot(rt, turn.run_id)
 
 
@@ -575,17 +653,20 @@ def create_web_app(
     user_id: str = "user_raj",
     scenario: str = "happy",
 ) -> FastAPI:
-    if scenario == "hold-expiry" and clock is None:
-        clock = FakeClock(datetime.now(IST))
+    resolved_dir = Path(data_dir)
+    # The demo clock starts on wall time and can be moved forward for the
+    # hold-expiry scenario without freezing the rest of the interface.
+    resolved_clock = clock or DemoClock()
     caps = BudgetCaps(turn_cap=1) if scenario == "limit-turns" else None
     rt = WebRuntime(
-        app=build_app(data_dir, clock=clock, user_id=user_id, caps=caps),
+        app=build_app(resolved_dir, clock=resolved_clock, user_id=user_id, caps=caps),
         user_id=user_id,
         scenario=scenario,
+        data_dir=resolved_dir,
     )
     rt.app.tracer.add_listener(rt.hub.publish)
     with rt.lock:
-        if scenario == "reschedule-conflict":
+        if scenario in {"reschedule-conflict", "cancel"}:
             rt.startup_notice = seed_demo_booking(rt.app, user_id)
         recovered = rt.app.conversation.recover_pending()
         if recovered:
@@ -628,12 +709,13 @@ def create_web_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
-        config = {
-            "scenario": scenario,
-            "scenario_summary": scenario_summary(scenario),
-            "user_id": user_id,
-            "startup_notice": rt.startup_notice,
-        }
+        with rt.lock:
+            config = {
+                "scenario": rt.scenario,
+                "scenario_summary": scenario_summary(rt.scenario),
+                "user_id": user_id,
+                "startup_notice": rt.startup_notice,
+            }
         return templates.TemplateResponse(
             request=request,
             name="index.html",
@@ -642,7 +724,15 @@ def create_web_app(
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "scenario": scenario}
+        return {"status": "ok", "scenario": rt.scenario}
+
+    @app.get("/api/demo")
+    async def get_demo() -> dict[str, Any]:
+        return await asyncio.to_thread(_demo_snapshot_only, rt)
+
+    @app.post("/api/demo/scenario")
+    async def arm_demo(body: DemoScenarioBody) -> dict[str, Any]:
+        return await asyncio.to_thread(_arm_scenario, rt, body.scenario)
 
     @app.get("/api/memory")
     async def get_memory() -> dict[str, Any]:

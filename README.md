@@ -2,13 +2,14 @@
 
 A local, offline errand booking agent with a code-enforced approval kernel.
 
-This repository currently implements tickets 01–10: a scripted CLI errand from
+This repository currently implements tickets 01–11: a scripted CLI errand from
 the first request to a verified booking, approval invalidation and hold expiry,
 timeout reconciliation with restart recovery, cancel/reschedule, untrusted
 review handling with injection defense, bounded execution with clear exits,
 memory with provenance and tombstones, a browser chat with a live trace, a
-memory panel in the same UI, and an offline eval harness with 20 scenarios and a
-generated table. Everything uses SQLite persistence and a JSONL trace.
+memory panel in the same UI, an offline eval harness with 20 scenarios and a
+generated table, and an in-browser demo panel with a committed trace artifact.
+Everything uses SQLite persistence and a JSONL trace.
 
 ## Run
 
@@ -78,9 +79,25 @@ uv run errand serve --scenario timeout-after-success
 Complete the booking in the side-by-side layout. The trace shows the timeout,
 the `get_booking_status` check, the reconciliation event, and the verified
 booking. The scenario is injected at the approval boundary, so the first
-approval card is genuine. Other browser scenarios are `quote-change`,
-`slot-change`, `hold-expiry`, `timeout-before-success`, `reschedule-conflict`,
-`injection`, `limit-turns`, and `unknown-error`.
+approval card is genuine.
+
+The **Demo** button in the top bar opens the same fault controls without
+restarting the server. It lists the armable scenarios, including
+timeout-after-success, injected review, hold expiry, slot conflict, and restart
+mid-booking. Each card has **Arm** and **Arm & start**; the first arms the
+scenario, the second clears the current run and starts the scenario's prompt. The
+scenario strip above the chat states what will happen. Faults are still injected
+by the kernel at the approval boundary, never by the model. The restart control
+rebuilds the kernel over the same SQLite database and recovers the in-flight
+intent in the same browser request; the trace shows the crash, the restart
+reconciliation, and the verified booking.
+
+`--scenario` remains available for a scripted startup, so the same fault can be
+armed before the page opens:
+
+```bash
+uv run errand serve --scenario hold-expiry
+```
 
 Use `--host`, `--port`, and `--data-dir` to change the listener or the SQLite
 location. The server binds `127.0.0.1` by default and makes no external calls.
@@ -166,6 +183,27 @@ asking, shows a hedged "mornings" preference as inferred and pending, proves
 that the pending fact is not used, confirms it, forgets the area, and starts a
 fresh session that asks for the area again. Replaying the old chat message does
 not restore the forgotten area. `memory list --all` also shows tombstones.
+
+## Committed trace
+
+The repository includes a raw timeout-after-success run at
+[`artifacts/traces/timeout-after-success.jsonl`](artifacts/traces/timeout-after-success.jsonl)
+and a short annotated excerpt at
+[`artifacts/traces/timeout-after-success.md`](artifacts/traces/timeout-after-success.md).
+The excerpt uses sequence numbers as the join key, so every annotation can be
+checked against the raw line. Regenerate both the event sequence and the file
+with:
+
+```bash
+uv run errand demo --scenario timeout-after-success \
+  --trace-out artifacts/traces/timeout-after-success.jsonl
+```
+
+The recording command uses a fresh database and a fixed clock. The trace shows
+one `book` call that times out after the provider committed, the
+`get_booking_status` check with the same idempotency key, the `booked`
+reconciliation, and the final verified state. A test compares the committed
+event and tool sequence with a fresh recording.
 
 ## What is enforced
 

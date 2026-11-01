@@ -663,6 +663,20 @@ class MockProviderWorld:
             return False
         return True
 
+    @staticmethod
+    def _slot_is_defined(provider: Provider, slot_start: datetime) -> bool:
+        """A slot time must match one of the provider's published times.
+
+        Availability is checked separately. This deliberately does not anchor
+        the date to "today": an existing hold must remain re-holdable even when
+        the clock crosses midnight between the quote and the approval.
+        """
+        local = slot_start.astimezone(IST)
+        return any(
+            local.hour == hour and local.minute == minute
+            for _day, hour, minute in provider.slot_offsets
+        )
+
     def _free_slots(
         self, provider: Provider, date_range: tuple[datetime, datetime]
     ) -> list[datetime]:
@@ -765,8 +779,11 @@ class MockProviderWorld:
             if slot_end - slot_start != timedelta(minutes=SLOT_MINUTES):
                 raise SlotUnavailable("unsupported slot length")
             now = self._now()
-            available = self._free_slots(provider, (slot_start, slot_end + timedelta(minutes=1)))
-            if slot_start not in available:
+            if slot_start < now + timedelta(minutes=30):
+                raise SlotUnavailable("slot is not available")
+            if not self._slot_is_defined(provider, slot_start):
+                raise SlotUnavailable("slot is not available")
+            if not self._slot_available(provider.id, slot_start):
                 raise SlotUnavailable("slot is not available")
             quoted_price, quote_version = self._quote_overrides.get(
                 (provider.id, slot_start), (provider.price_inr, 1)
