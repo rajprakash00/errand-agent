@@ -307,7 +307,15 @@ class Conversation:
     def correct_memory(
         self, user_id: str, key: MemoryKey | str, value: str, *, run_id: str | None = None
     ) -> MemoryFact | None:
-        return self.remember_memory(user_id, key, value, run_id=run_id)
+        resolved = self._memory_key(key)
+        fact = self.memory.record_stated(
+            user_id, resolved, self._canonical_fact_value(resolved, value)
+        )
+        if run_id is not None:
+            self._trace_memory_write(
+                run_id, "stated", resolved, fact, action="correct"
+            )
+        return fact
 
     def confirm_memory(
         self, user_id: str, key: MemoryKey | str, *, run_id: str | None = None
@@ -1407,11 +1415,12 @@ class Conversation:
         *,
         source_turn_id: str | None = None,
         reason: str | None = None,
+        action: str = "remember",
     ) -> None:
         payload: dict[str, object] = {
             "key": key.value,
             "provenance": provenance,
-            "action": "remember",
+            "action": action,
         }
         if source_turn_id is not None:
             payload["source_turn_id"] = source_turn_id
