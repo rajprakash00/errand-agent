@@ -16,6 +16,16 @@
     stateChip: document.getElementById("state-chip"),
     stateLabel: document.getElementById("state-label"),
     newErrand: document.getElementById("new-errand"),
+    memoryButton: document.getElementById("memory-button"),
+    memoryCount: document.getElementById("memory-count"),
+    memoryDialog: document.getElementById("memory-dialog"),
+    memoryClose: document.getElementById("memory-close"),
+    memorySubtitle: document.getElementById("memory-subtitle"),
+    memoryScroll: document.getElementById("memory-scroll"),
+    memoryEmpty: document.getElementById("memory-empty"),
+    memoryList: document.getElementById("memory-list"),
+    memoryNote: document.getElementById("memory-note"),
+    memoryAreas: document.getElementById("memory-areas"),
     scenarioStrip: document.getElementById("scenario-strip"),
     composer: document.getElementById("composer"),
     composerField: document.getElementById("composer-field"),
@@ -53,6 +63,8 @@
     toastTimer: null,
     mobileView: "chat",
     chatPinned: true,
+    memory: null,
+    memoryBusy: false,
   };
 
   const timeFormatter = new Intl.DateTimeFormat("en-IN", {
@@ -138,6 +150,14 @@
     el.newErrand.addEventListener("click", newErrand);
     document.getElementById("new-errand-finished").addEventListener("click", newErrand);
 
+    el.memoryButton.addEventListener("click", openMemory);
+    el.memoryClose.addEventListener("click", closeMemory);
+    el.memoryDialog.addEventListener("click", (event) => {
+      if (event.target === el.memoryDialog) closeMemory();
+    });
+    el.memoryList.addEventListener("click", onMemoryClick);
+    el.memoryList.addEventListener("submit", onMemorySubmit);
+
     el.tabChat.addEventListener("click", () => setMobileView("chat"));
     el.tabTrace.addEventListener("click", () => setMobileView("trace"));
 
@@ -221,6 +241,7 @@
       applySnapshot(data, { resetTrace: true });
       await syncTrace(data.run_id);
       if (!isDone(data)) connectStream(data);
+      void loadMemory({ silent: true });
     } catch (error) {
       showToast(error.message);
     } finally {
@@ -246,6 +267,7 @@
       }
       el.input.value = "";
       autoGrow();
+      void loadMemory({ silent: true });
     } catch (error) {
       showToast(error.message);
       await refreshSnapshot();
@@ -261,6 +283,393 @@
       applySnapshot(data);
     } catch {
       // The toast already tells the user the request failed.
+    }
+  }
+
+  /* -- memory panel ------------------------------------------------------ */
+
+  async function loadMemory({ silent = false } = {}) {
+    try {
+      const data = await requestJSON("/api/memory");
+      state.memory = data;
+      renderMemory();
+    } catch (error) {
+      console.error("Memory panel failed to load", error);
+      if (!silent) showToast(error.message);
+    }
+  }
+
+  function openMemory() {
+    if (!el.memoryDialog.open) el.memoryDialog.showModal();
+    if (state.memory) {
+      renderMemory();
+    } else {
+      el.memoryEmpty.hidden = true;
+      el.memoryList.hidden = true;
+      el.memoryNote.hidden = false;
+      el.memoryNote.textContent = "Loading saved preferences…";
+    }
+    void loadMemory();
+  }
+
+  function closeMemory() {
+    if (el.memoryDialog.open) el.memoryDialog.close();
+  }
+
+  function renderMemory() {
+    const data = state.memory;
+    if (!data) return;
+    const count = Number(data.count) || 0;
+    const pending = Number(data.pending_count) || 0;
+
+    el.memoryCount.textContent = String(count);
+    el.memoryCount.hidden = count === 0;
+    el.memoryButton.classList.toggle("has-pending", pending > 0);
+    el.memorySubtitle.textContent =
+      count === 0
+        ? `Saved for ${data.user_id}. Nothing saved yet.`
+        : `${count} saved for ${data.user_id}${pending ? ` · ${pending} pending` : ""}.`;
+
+    el.memoryEmpty.hidden = count !== 0;
+    el.memoryList.hidden = count === 0;
+    el.memoryList.replaceChildren(...(data.facts || []).map(memoryFactRow));
+
+    el.memoryAreas.replaceChildren(
+      ...(data.areas || []).map((area) => {
+        const option = document.createElement("option");
+        option.value = area;
+        return option;
+      })
+    );
+
+    el.memoryNote.hidden = pending === 0;
+    el.memoryNote.textContent =
+      pending > 0
+        ? "Pending inferences are not used. Confirm one to apply it to your next search."
+        : "";
+  }
+
+  function memoryBadge(label, className) {
+    const badge = document.createElement("span");
+    badge.className = `memory-badge ${className}`;
+    badge.textContent = label;
+    return badge;
+  }
+
+  function memoryActionButton(label, action, key, className = "button button-ghost button-sm") {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.dataset.memoryAction = action;
+    button.dataset.key = key;
+    button.textContent = label;
+    return button;
+  }
+
+  function memoryFactRow(fact) {
+    const item = document.createElement("li");
+    item.className = "memory-fact";
+    item.dataset.key = fact.key;
+    item.dataset.status = fact.status;
+    if (fact.pending) item.classList.add("is-pending");
+
+    const top = document.createElement("div");
+    top.className = "memory-fact-top";
+
+    const heading = document.createElement("h3");
+    heading.className = "memory-fact-key";
+    heading.textContent = fact.key_label;
+
+    const badges = document.createElement("div");
+    badges.className = "memory-badges";
+    badges.appendChild(
+      memoryBadge(fact.provenance_label, `memory-badge-${fact.provenance}`)
+    );
+    badges.appendChild(
+      fact.pending
+        ? memoryBadge("Pending", "memory-badge-pending")
+        : memoryBadge("Active", "memory-badge-active")
+    );
+    top.append(heading, badges);
+
+    const value = document.createElement("p");
+    value.className = "memory-fact-value";
+    value.textContent = fact.value_label;
+
+    const hint = document.createElement("p");
+    hint.className = "memory-fact-hint";
+    hint.textContent = fact.key_hint;
+
+    item.append(top, value, hint);
+
+    if (fact.pending) {
+      const note = document.createElement("p");
+      note.className = "memory-fact-note";
+      note.textContent =
+        "Inferred from your message. This is not used in a search until you confirm it.";
+      item.appendChild(note);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "memory-actions";
+    if (fact.pending) {
+      const confirm = memoryActionButton(
+        "Confirm",
+        "confirm",
+        fact.key,
+        "button button-primary button-sm"
+      );
+      confirm.setAttribute("aria-label", `Confirm ${fact.key_label.toLowerCase()}`);
+      actions.appendChild(confirm);
+    }
+    const correct = memoryActionButton("Correct", "edit", fact.key);
+    correct.setAttribute("aria-label", `Correct ${fact.key_label.toLowerCase()}`);
+    const forget = memoryActionButton(
+      "Forget",
+      "forget",
+      fact.key,
+      "button button-danger button-sm"
+    );
+    forget.setAttribute("aria-label", `Forget ${fact.key_label.toLowerCase()}`);
+    actions.append(correct, forget);
+    item.appendChild(actions);
+
+    item.appendChild(memoryEditor(fact));
+    item.appendChild(memoryForgetConfirm(fact));
+    return item;
+  }
+
+  function memoryEditor(fact) {
+    const form = document.createElement("form");
+    form.className = "memory-edit";
+    form.dataset.key = fact.key;
+    form.hidden = true;
+
+    const label = document.createElement("label");
+    label.className = "memory-edit-label";
+    label.htmlFor = `memory-edit-${fact.key}`;
+    label.textContent =
+      fact.key === "earliest_time"
+        ? "New earliest time"
+        : fact.key === "preferred_provider_id"
+          ? "New provider"
+          : "New area";
+
+    let field;
+    if (fact.key === "preferred_provider_id") {
+      field = document.createElement("select");
+      for (const provider of (state.memory && state.memory.providers) || []) {
+        const option = document.createElement("option");
+        option.value = provider.id;
+        option.textContent = provider.name;
+        if (provider.id === fact.value) option.selected = true;
+        field.appendChild(option);
+      }
+    } else if (fact.key === "earliest_time") {
+      field = document.createElement("input");
+      field.type = "time";
+      field.step = "60";
+      field.value = fact.value || "";
+    } else {
+      field = document.createElement("input");
+      field.type = "text";
+      field.setAttribute("list", "memory-areas");
+      field.maxLength = 120;
+      field.autocomplete = "off";
+      field.value = fact.value || "";
+    }
+    field.id = `memory-edit-${fact.key}`;
+    field.name = "value";
+    field.className = "memory-edit-input";
+    field.required = true;
+
+    const controls = document.createElement("div");
+    controls.className = "memory-edit-controls";
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.className = "button button-primary button-sm";
+    save.textContent = "Save";
+    controls.append(save, memoryActionButton("Cancel", "cancel-edit", fact.key));
+
+    form.append(label, field, controls);
+    return form;
+  }
+
+  function memoryForgetConfirm(fact) {
+    const block = document.createElement("div");
+    block.className = "memory-forget";
+    block.hidden = true;
+
+    const copy = document.createElement("p");
+    copy.className = "memory-forget-copy";
+    copy.textContent =
+      "Forget this fact? The value is deleted and never used in a new search.";
+
+    const actions = document.createElement("div");
+    actions.className = "memory-forget-actions";
+    const forgetForever = memoryActionButton(
+      "Forget permanently",
+      "forget-confirm",
+      fact.key,
+      "button button-danger button-sm"
+    );
+    forgetForever.setAttribute(
+      "aria-label",
+      `Forget ${fact.key_label.toLowerCase()} permanently`
+    );
+    actions.append(
+      forgetForever,
+      memoryActionButton("Keep", "cancel-forget", fact.key)
+    );
+
+    block.append(copy, actions);
+    return block;
+  }
+
+  function onMemoryClick(event) {
+    const target = event.target.closest("[data-memory-action]");
+    if (!target || state.memoryBusy) return;
+    const action = target.dataset.memoryAction;
+    const key = target.dataset.key;
+    const item = target.closest(".memory-fact");
+    if (!key || !item) return;
+
+    if (action === "edit") {
+      showMemoryEditor(item);
+    } else if (action === "cancel-edit") {
+      hideMemoryEditor(item);
+    } else if (action === "forget") {
+      showMemoryForget(item);
+    } else if (action === "cancel-forget") {
+      hideMemoryForget(item);
+    } else if (action === "confirm") {
+      void runMemoryAction(key, "confirm");
+    } else if (action === "forget-confirm") {
+      void runMemoryAction(key, "forget");
+    }
+  }
+
+  function onMemorySubmit(event) {
+    const form = event.target.closest(".memory-edit");
+    if (!form) return;
+    event.preventDefault();
+    if (state.memoryBusy) return;
+    const field = form.querySelector(".memory-edit-input");
+    const value = field ? String(field.value).trim() : "";
+    if (!value) {
+      showToast("Enter a new value first.");
+      if (field) field.focus();
+      return;
+    }
+    void runMemoryCorrection(form.dataset.key, value);
+  }
+
+  function showMemoryEditor(item) {
+    const actions = item.querySelector(".memory-actions");
+    const form = item.querySelector(".memory-edit");
+    const forget = item.querySelector(".memory-forget");
+    if (!form) return;
+    if (actions) actions.hidden = true;
+    if (forget) forget.hidden = true;
+    form.hidden = false;
+    item.classList.add("is-editing");
+    const field = form.querySelector(".memory-edit-input");
+    if (field) {
+      field.focus();
+      if (field.select) field.select();
+    }
+  }
+
+  function hideMemoryEditor(item) {
+    const form = item.querySelector(".memory-edit");
+    const actions = item.querySelector(".memory-actions");
+    if (form) form.hidden = true;
+    if (actions) actions.hidden = false;
+    item.classList.remove("is-editing");
+  }
+
+  function showMemoryForget(item) {
+    const actions = item.querySelector(".memory-actions");
+    const form = item.querySelector(".memory-edit");
+    const forget = item.querySelector(".memory-forget");
+    if (!forget) return;
+    if (actions) actions.hidden = true;
+    if (form) form.hidden = true;
+    forget.hidden = false;
+    item.classList.add("is-forgetting");
+    const confirm = forget.querySelector('[data-memory-action="forget-confirm"]');
+    if (confirm) confirm.focus();
+  }
+
+  function hideMemoryForget(item) {
+    const forget = item.querySelector(".memory-forget");
+    const actions = item.querySelector(".memory-actions");
+    if (forget) forget.hidden = true;
+    if (actions) actions.hidden = false;
+    item.classList.remove("is-forgetting");
+  }
+
+  async function runMemoryAction(key, action) {
+    if (state.memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      const data = await requestJSON(
+        `/api/memory/${encodeURIComponent(key)}/${action}`,
+        { run_id: memoryRunId() }
+      );
+      state.memory = data.memory;
+      renderMemory();
+      const label = data.fact ? data.fact.key_label : "Preference";
+      showToast(
+        action === "confirm"
+          ? `${label} confirmed. It will be used in your next search.`
+          : `${label} forgotten. It will not be used again.`
+      );
+      afterMemoryChange();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function runMemoryCorrection(key, value) {
+    if (state.memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      const data = await requestJSON(
+        `/api/memory/${encodeURIComponent(key)}/correct`,
+        { value, run_id: memoryRunId() }
+      );
+      state.memory = data.memory;
+      renderMemory();
+      const label = data.fact ? data.fact.key_label : "Preference";
+      const shown = data.fact ? data.fact.value_label : value;
+      showToast(`${label} corrected to ${shown}. The next search will use it.`);
+      afterMemoryChange();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  function setMemoryBusy(busy) {
+    state.memoryBusy = busy;
+    el.memoryDialog.setAttribute("aria-busy", String(busy));
+    el.memoryList.querySelectorAll("button, input, select").forEach((node) => {
+      node.disabled = busy;
+    });
+  }
+
+  function memoryRunId() {
+    if (!state.runId || !state.snapshot || isDone(state.snapshot)) return null;
+    return state.runId;
+  }
+
+  function afterMemoryChange() {
+    if (state.runId && state.snapshot && !isDone(state.snapshot)) {
+      void syncTrace(state.runId);
     }
   }
 
@@ -1387,6 +1796,7 @@
   bindEvents();
   updateStreamStatus("idle", "Waiting");
   autoGrow();
+  void loadMemory({ silent: true });
   if (window.matchMedia("(pointer: fine)").matches) {
     el.input.focus({ preventScroll: true });
   }

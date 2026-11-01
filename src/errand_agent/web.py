@@ -43,6 +43,9 @@ from errand_agent.formatting import (
 from errand_agent.models import (
     Action,
     ApprovalCard,
+    FactStatus,
+    MemoryFact,
+    MemoryKey,
     Proposal,
     RequiredSlot,
     RunRecord,
@@ -80,6 +83,20 @@ ACTION_LABELS: dict[Action, str] = {
 SLOT_SUGGESTIONS: dict[RequiredSlot, tuple[str, ...]] = {
     RequiredSlot.SERVICE: ("Plumber", "Electrician", "Carpenter", "Cleaner"),
     RequiredSlot.TIME_WINDOW: ("This week", "Tomorrow", "Saturday", "Next week"),
+}
+
+MEMORY_KEY_LABELS: dict[MemoryKey, str] = {
+    MemoryKey.AREA: "Area",
+    MemoryKey.EARLIEST_TIME: "Earliest time",
+    MemoryKey.PREFERRED_PROVIDER_ID: "Preferred provider",
+}
+
+MEMORY_KEY_HINTS: dict[MemoryKey, str] = {
+    MemoryKey.AREA: "Used to fill the area when you do not name one.",
+    MemoryKey.EARLIEST_TIME: (
+        "Filters out earlier slots once the agent knows your day or date range."
+    ),
+    MemoryKey.PREFERRED_PROVIDER_ID: "Moves this provider to the top of a new search.",
 }
 
 
@@ -148,6 +165,15 @@ class WebRuntime:
 
 class MessageBody(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+
+
+class MemoryCorrectionBody(BaseModel):
+    value: str = Field(min_length=1, max_length=120)
+    run_id: str | None = Field(default=None, max_length=80)
+
+
+class MemoryActionBody(BaseModel):
+    run_id: str | None = Field(default=None, max_length=80)
 
 
 def _provider_name_for_proposal(app: App, proposal: Proposal) -> str:
@@ -263,6 +289,148 @@ def _booking_payload(booking: Any) -> dict[str, Any] | None:
         "status": booking.status,
         "status_label": status_labels.get(booking.status, booking.status.title()),
     }
+
+
+def _memory_time_label(value: str) -> str:
+    """Render a canonical HH:MM preference as a 12-hour label."""
+    try:
+        hour, minute = (int(part) for part in value.split(":", 1))
+    except (TypeError, ValueError):
+        return value
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return value
+    suffix = "AM" if hour < 12 else "PM"
+    return f"{hour % 12 or 12}:{minute:02d} {suffix}"
+
+
+def _memory_value_label(app: App, fact: MemoryFact) -> str:
+    if fact.value is None:
+        return "(forgotten)"
+    if fact.key == MemoryKey.EARLIEST_TIME:
+        return _memory_time_label(fact.value)
+    if fact.key == MemoryKey.PREFERRED_PROVIDER_ID:
+        return app.world.provider_names.get(fact.value, fact.value)
+    return fact.value
+
+
+def _memory_fact_payload(app: App, fact: MemoryFact) -> dict[str, Any]:
+    provenance_labels = {"stated": "You said", "inferred": "Inferred"}
+    status_labels = {
+        FactStatus.ACTIVE: "Active",
+        FactStatus.PENDING_CONFIRMATION: "Pending confirmation",
+        FactStatus.ARCHIVED: "Archived",
+        FactStatus.FORGOTTEN: "Forgotten",
+    }
+    return {
+        "id": fact.id,
+        "key": fact.key.value,
+        "key_label": MEMORY_KEY_LABELS.get(fact.key, fact.key.value.replace("_", " ")),
+        "key_hint": MEMORY_KEY_HINTS.get(fact.key, ""),
+        "value": fact.value,
+        "value_label": _memory_value_label(app, fact),
+        "provenance": fact.provenance.value,
+        "provenance_label": provenance_labels.get(
+            fact.provenance.value, fact.provenance.value
+        ),
+        "status": fact.status.value,
+        "status_label": status_labels.get(fact.status, fact.status.value),
+        "pending": fact.status == FactStatus.PENDING_CONFIRMATION,
+        "confirmed_by": fact.confirmed_by,
+        "created_at": _iso(fact.created_at),
+        "updated_at": _iso(fact.updated_at),
+    }
+
+
+def _memory_snapshot(rt: WebRuntime) -> dict[str, Any]:
+    """The memory panel view: active and pending facts plus edit choices."""
+    facts = rt.app.conversation.list_memory(rt.user_id)
+    providers = sorted(
+        (
+            {"id": provider_id, "name": name}
+            for provider_id, name in rt.app.world.provider_names.items()
+        ),
+        key=lambda item: item["name"],
+    )
+    return {
+        "user_id": rt.user_id,
+        "facts": [_memory_fact_payload(rt.app, fact) for fact in facts],
+        "empty": not facts,
+        "count": len(facts),
+        "pending_count": sum(
+            1 for fact in facts if fact.status == FactStatus.PENDING_CONFIRMATION
+        ),
+        "areas": list(rt.app.world.areas),
+        "providers": providers,
+        "keys": [
+            {
+                "value": key.value,
+                "label": MEMORY_KEY_LABELS.get(key, key.value.replace("_", " ")),
+                "hint": MEMORY_KEY_HINTS.get(key, ""),
+            }
+            for key in MemoryKey
+        ],
+    }
+
+
+def _memory_run_id(rt: WebRuntime, run_id: str | None) -> str | None:
+    """Trace a memory edit to the current run when it belongs to this user."""
+    if not run_id:
+        return None
+    run = rt.app.store.get_run(run_id)
+    if run is None or run.user_id != rt.user_id:
+        return None
+    return run_id
+
+
+def _memory_snapshot_only(rt: WebRuntime) -> dict[str, Any]:
+    with rt.lock:
+        return _memory_snapshot(rt)
+
+
+def _correct_memory(
+    rt: WebRuntime, key: MemoryKey, value: str, run_id: str | None
+) -> dict[str, Any]:
+    with rt.lock:
+        fact = rt.app.conversation.correct_memory(
+            rt.user_id, key, value, run_id=_memory_run_id(rt, run_id)
+        )
+        return {
+            "fact": _memory_fact_payload(rt.app, fact) if fact is not None else None,
+            "memory": _memory_snapshot(rt),
+        }
+
+
+def _confirm_memory(
+    rt: WebRuntime, key: MemoryKey, run_id: str | None
+) -> dict[str, Any]:
+    with rt.lock:
+        fact = rt.app.conversation.confirm_memory(
+            rt.user_id, key, run_id=_memory_run_id(rt, run_id)
+        )
+        return {
+            "fact": _memory_fact_payload(rt.app, fact) if fact is not None else None,
+            "memory": _memory_snapshot(rt),
+        }
+
+
+def _forget_memory(
+    rt: WebRuntime, key: MemoryKey, run_id: str | None
+) -> dict[str, Any]:
+    with rt.lock:
+        fact = rt.app.conversation.forget_memory(
+            rt.user_id, key, run_id=_memory_run_id(rt, run_id)
+        )
+        return {
+            "fact": _memory_fact_payload(rt.app, fact) if fact is not None else None,
+            "memory": _memory_snapshot(rt),
+        }
+
+
+def _resolve_memory_key(key: str) -> MemoryKey:
+    try:
+        return MemoryKey(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="unknown memory key") from exc
 
 
 def snapshot(rt: WebRuntime, run_id: str) -> dict[str, Any]:
@@ -475,6 +643,46 @@ def create_web_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "scenario": scenario}
+
+    @app.get("/api/memory")
+    async def get_memory() -> dict[str, Any]:
+        return await asyncio.to_thread(_memory_snapshot_only, rt)
+
+    @app.post("/api/memory/{key}/correct")
+    async def correct_memory(key: str, body: MemoryCorrectionBody) -> dict[str, Any]:
+        resolved = _resolve_memory_key(key)
+        value = body.value.strip()
+        if not value:
+            raise HTTPException(status_code=422, detail="value must not be empty")
+        try:
+            result = await asyncio.to_thread(
+                _correct_memory, rt, resolved, value, body.run_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if result["fact"] is None:
+            raise HTTPException(
+                status_code=409, detail="the preference could not be saved"
+            )
+        return result
+
+    @app.post("/api/memory/{key}/confirm")
+    async def confirm_memory(key: str, body: MemoryActionBody) -> dict[str, Any]:
+        resolved = _resolve_memory_key(key)
+        result = await asyncio.to_thread(_confirm_memory, rt, resolved, body.run_id)
+        if result["fact"] is None:
+            raise HTTPException(
+                status_code=404, detail="no saved preference to confirm"
+            )
+        return result
+
+    @app.post("/api/memory/{key}/forget")
+    async def forget_memory(key: str, body: MemoryActionBody) -> dict[str, Any]:
+        resolved = _resolve_memory_key(key)
+        result = await asyncio.to_thread(_forget_memory, rt, resolved, body.run_id)
+        if result["fact"] is None:
+            raise HTTPException(status_code=404, detail="no saved preference to forget")
+        return result
 
     @app.post("/api/errands")
     async def start_errand(body: MessageBody) -> dict[str, Any]:
