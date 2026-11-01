@@ -50,13 +50,14 @@ ALLOWED_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
             RunState.AWAITING_APPROVAL,
             RunState.CANCELLED,
             RunState.FAILED,
+            RunState.LIMIT_REACHED,
         }
     ),
 }
 
 for _state in ACTIVE_STATES:
     ALLOWED_TRANSITIONS[_state] = ALLOWED_TRANSITIONS[_state] | frozenset(
-        {RunState.LIMIT_REACHED, RunState.CANCELLED}
+        {RunState.LIMIT_REACHED, RunState.CANCELLED, RunState.FAILED}
     )
 
 
@@ -162,3 +163,28 @@ def parse_option_selection(text: str, count: int) -> int | None:
         return None
     index = int(match.group(1)) - 1
     return index if 0 <= index < count else None
+
+
+REVIEW_WORD = re.compile(r"\breviews?\b", re.IGNORECASE)
+REVIEW_NOISE = re.compile(
+    r"\b(?:show|see|me|the|reviews?|for|please|provider|option|number)\b",
+    re.IGNORECASE,
+)
+
+
+def is_review_request(text: str) -> bool:
+    return REVIEW_WORD.search(text) is not None
+
+
+def parse_review_selection(text: str, count: int) -> int | None:
+    """Return the provider index a review request names, if it names one."""
+    match = re.search(r"(?:option|number|#)?\s*(\d+)", text)
+    if match is not None:
+        index = int(match.group(1)) - 1
+        return index if 0 <= index < count else None
+    return None
+
+
+def review_name_query(text: str) -> str:
+    """Strip review-request words so a provider name can be matched."""
+    return re.sub(r"\s+", " ", REVIEW_NOISE.sub(" ", text)).strip()

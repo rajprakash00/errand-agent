@@ -177,8 +177,8 @@ awaiting_approval   -> executing | options_ready | cancelled | failed
 executing           -> verifying | reconciling | needs_human | failed
 reconciling         -> verifying | executing | needs_human | failed
 verifying           -> completed | needs_human | failed
-needs_human         -> collecting | searching | options_ready | awaiting_approval | cancelled | failed
-any active state    -> limit_reached | cancelled
+needs_human         -> collecting | searching | options_ready | awaiting_approval | cancelled | failed | limit_reached
+any active state    -> limit_reached | cancelled | failed
 ```
 
 Every transition writes a trace event. An invalid transition raises an error and is a test failure.

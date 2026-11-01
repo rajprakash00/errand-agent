@@ -15,13 +15,17 @@ from errand_agent.approval import (
     compute_binding_hash,
     record_approval,
 )
+from errand_agent.budget import BudgetExceeded, BudgetKeeper
 from errand_agent.clock import Clock
 from errand_agent.db import Store
 from errand_agent.dialogue import (
+    is_review_request,
     is_terminal,
     merge_slots,
     parse_confirmation,
     parse_option_selection,
+    parse_review_selection,
+    review_name_query,
 )
 from errand_agent.guard import (
     CancelFailed,
@@ -34,6 +38,7 @@ from errand_agent.guard import (
 )
 from errand_agent.ids import new_id
 from errand_agent.model import DraftRequest, ExtractionContext, ScriptedModel
+from errand_agent.model_tools import ModelToolbox
 from errand_agent.models import (
     Action,
     ApprovalCard,
@@ -49,6 +54,7 @@ from errand_agent.models import (
     TimeWindow,
     TurnResult,
 )
+from errand_agent.reviews import policy_material, quote_review
 from errand_agent.runtime import Runtime
 from errand_agent.toolbox import Toolbox
 from errand_agent.trace import Tracer
@@ -56,6 +62,7 @@ from errand_agent.world import (
     HOLD_MINUTES,
     Hold,
     MockProviderWorld,
+    ProcessCrash,
     SlotUnavailable,
     WorldBooking,
 )
@@ -79,6 +86,7 @@ class Conversation:
         runtime: Runtime | None = None,
         toolbox: Toolbox | None = None,
         guard: ExecutionGuard | None = None,
+        budget: BudgetKeeper | None = None,
     ) -> None:
         self.store = store
         self.world = world
@@ -86,8 +94,11 @@ class Conversation:
         self.clock = clock
         self.model = model
         self.runtime = runtime or Runtime(store, tracer, clock)
-        self.toolbox = toolbox or Toolbox(world, tracer, clock)
+        self.budget = budget or BudgetKeeper(store, clock)
+        self.toolbox = toolbox or Toolbox(world, tracer, clock, self.budget)
         self.guard = guard or ExecutionGuard(store, self.toolbox, self.runtime, clock)
+        if hasattr(self.model, "bind_tools"):
+            self.model.bind_tools(lambda run_id: ModelToolbox(self.toolbox, run_id))
 
     # -- public seam --------------------------------------------------------
 
@@ -97,55 +108,81 @@ class Conversation:
         trace_path = str(self.tracer.path_for(run_id))
         now = self.clock.now()
         self.store.create_run(run_id, user_id, RunState.INTAKE, trace_path, now, action=action)
+        self.budget.start_run(run_id)
         self.runtime.trace(
             run_id,
             "run_started",
             {"user_id": user_id, "action": action.value, "trace_version": 1},
         )
-        self.runtime.user_message(run_id, text)
-        self.runtime.trace(
-            run_id,
-            "model_call",
-            {
-                "model": self.model.name,
-                "role": "extract_intent",
-                "prompt_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                "message_count": 1,
-                "tool_names": [],
-                "tokens": 0,
-                "cost": 0.0,
-                "excerpt": text[:200],
-                "result": action.value,
-            },
-        )
-        self.runtime.transition(run_id, RunState.COLLECTING, reason="intake")
-        if action == Action.CANCEL:
-            return self._collect_cancel(run_id, text)
-        if action == Action.RESCHEDULE:
-            return self._collect_reschedule(run_id, text)
-        return self._collect(run_id, text)
+        try:
+            self.budget.begin_turn(run_id)
+            self.budget.spend_model_turn(run_id)
+            self.runtime.user_message(run_id, text)
+            self.runtime.trace(
+                run_id,
+                "model_call",
+                {
+                    "model": self.model.name,
+                    "role": "extract_intent",
+                    "prompt_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "message_count": 1,
+                    "tool_names": [],
+                    "tokens": 0,
+                    "cost": 0.0,
+                    "excerpt": text[:200],
+                    "result": action.value,
+                },
+            )
+            self.runtime.transition(run_id, RunState.COLLECTING, reason="intake")
+            if action == Action.CANCEL:
+                return self._collect_cancel(run_id, text)
+            if action == Action.RESCHEDULE:
+                return self._collect_reschedule(run_id, text)
+            return self._collect(run_id, text)
+        except BudgetExceeded as exc:
+            return self._limit_reached(run_id, exc.reason)
+        except ProcessCrash:
+            raise
+        except Exception as exc:
+            return self._unknown_failure(run_id, exc)
 
     def send_message(self, run_id: str, text: str) -> TurnResult:
         run = self.store.require_run(run_id)
         if is_terminal(run.state):
-            latest = self.store.get_latest_proposal_for_run(run_id)
-            booking = None
-            if latest is not None and latest.action == Action.BOOK:
-                booking = self.store.get_booking_by_proposal(latest.id)
-            if booking is not None:
-                # A repeated confirmation after completion returns the existing
-                # booking. It never writes an approval or calls book again.
-                message = self.model.draft(
-                    DraftRequest(
-                        kind="already_booked",
-                        data={"booking": booking, "trace_path": run.trace_path},
-                    )
+            return self._terminal_reply(run_id, run)
+        try:
+            self.budget.begin_turn(run_id)
+            return self._send_message(run_id, text)
+        except BudgetExceeded as exc:
+            return self._limit_reached(run_id, exc.reason)
+        except ProcessCrash:
+            raise
+        except Exception as exc:
+            return self._unknown_failure(run_id, exc)
+
+    def _terminal_reply(self, run_id: str, run) -> TurnResult:
+        latest = self.store.get_latest_proposal_for_run(run_id)
+        booking = None
+        if latest is not None and latest.action == Action.BOOK:
+            booking = self.store.get_booking_by_proposal(latest.id)
+        if booking is not None:
+            # A repeated confirmation after completion returns the existing
+            # booking. It never writes an approval or calls book again.
+            message = self.model.draft(
+                DraftRequest(
+                    kind="already_booked",
+                    data={"booking": booking, "trace_path": run.trace_path},
+                    run_id=run_id,
                 )
-                self.runtime.assistant_message(run_id, message)
-                return self._turn(run_id, [message], booking=booking)
-            message = "This errand is already finished. Nothing else was changed."
+            )
             self.runtime.assistant_message(run_id, message)
-            return self._turn(run_id, [message])
+            return self._turn(run_id, [message], booking=booking)
+        message = "This errand is already finished. Nothing else was changed."
+        self.runtime.assistant_message(run_id, message)
+        return self._turn(run_id, [message])
+
+    def _send_message(self, run_id: str, text: str) -> TurnResult:
+        run = self.store.require_run(run_id)
         self.runtime.user_message(run_id, text)
         if run.state == RunState.COLLECTING:
             if run.action == Action.CANCEL:
@@ -158,6 +195,8 @@ class Conversation:
                 return self._collect_cancel(run_id, text)
             if run.action == Action.RESCHEDULE:
                 return self._collect_reschedule(run_id, text)
+            if is_review_request(text):
+                return self._handle_reviews(run_id, text)
             return self._select_option(run_id, text)
         if run.state == RunState.AWAITING_APPROVAL:
             return self._handle_confirmation(run_id, text)
@@ -193,9 +232,7 @@ class Conversation:
                 )
             elif outcome.target_state == RunState.FAILED:
                 if outcome.action == Action.CANCEL:
-                    message = self._draft(
-                        run.id, "cancel_failed", {"trace_path": run.trace_path}
-                    )
+                    message = self._draft(run.id, "cancel_failed", {"trace_path": run.trace_path})
                 elif outcome.action == Action.RESCHEDULE:
                     message = self._draft(
                         run.id, "reschedule_failed", {"trace_path": run.trace_path}
@@ -207,9 +244,7 @@ class Conversation:
                         {"reason": outcome.reason, "trace_path": run.trace_path},
                     )
             else:
-                message = self._draft(
-                    run.id, "recovery_parked", {"trace_path": run.trace_path}
-                )
+                message = self._draft(run.id, "recovery_parked", {"trace_path": run.trace_path})
             self.runtime.finish(
                 run.id,
                 outcome.target_state,
@@ -220,9 +255,7 @@ class Conversation:
                     "proposal_id": outcome.proposal_id,
                 },
             )
-            turns.append(
-                self._turn(run.id, [message], booking=outcome.booking)
-            )
+            turns.append(self._turn(run.id, [message], booking=outcome.booking))
         return turns
 
     # -- collecting ---------------------------------------------------------
@@ -250,6 +283,7 @@ class Conversation:
         pending: RequiredSlot | None,
         known_slots: ErrandSlots,
     ) -> ErrandSlots:
+        self.budget.spend_model_turn(run_id)
         context = ExtractionContext(
             pending_slot=pending,
             known_slots=known_slots,
@@ -469,9 +503,7 @@ class Conversation:
             return self._turn(run_id, [message])
 
         if run.slots.time_window is None:
-            self.runtime.transition(
-                run_id, RunState.COLLECTING, reason="awaiting new time window"
-            )
+            self.runtime.transition(run_id, RunState.COLLECTING, reason="awaiting new time window")
             message = self._draft(run_id, "ask_slot", {"slot": RequiredSlot.TIME_WINDOW})
             self.runtime.assistant_message(run_id, message)
             return self._turn(run_id, [message], requested_slot=RequiredSlot.TIME_WINDOW)
@@ -483,9 +515,7 @@ class Conversation:
         options = self._reschedule_options(run_id, local, window)
         _, slots = self._reschedule_candidates(options, local, set())
         if not slots:
-            self.runtime.transition(
-                run_id, RunState.NEEDS_HUMAN, reason="no replacement slots"
-            )
+            self.runtime.transition(run_id, RunState.NEEDS_HUMAN, reason="no replacement slots")
             message = self._draft(
                 run_id,
                 "no_reschedule_slots",
@@ -511,9 +541,7 @@ class Conversation:
     def _reschedule_options(
         self, run_id: str, booking: BookingRecord, window: TimeWindow
     ) -> list[ProviderOption]:
-        details = self.toolbox.call(
-            run_id, "get_provider", provider_id=booking.provider_id
-        )
+        details = self.toolbox.call(run_id, "get_provider", provider_id=booking.provider_id)
         results = self.toolbox.call(
             run_id,
             "search_providers",
@@ -541,15 +569,11 @@ class Conversation:
         booking: BookingRecord,
         exclude: set[datetime],
     ) -> tuple[ProviderOption | None, list[datetime]]:
-        option = next(
-            (item for item in options if item.provider_id == booking.provider_id), None
-        )
+        option = next((item for item in options if item.provider_id == booking.provider_id), None)
         if option is None:
             return None, []
         slots = [
-            slot
-            for slot in option.free_slots
-            if slot != booking.slot_start and slot not in exclude
+            slot for slot in option.free_slots if slot != booking.slot_start and slot not in exclude
         ]
         return option, sorted(slots)
 
@@ -559,9 +583,7 @@ class Conversation:
         run = self.store.require_run(run_id)
         booking = self.store.get_booking_by_id(proposal.booking_id or "")
         if booking is None:
-            message = self._draft(
-                run_id, "reschedule_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "reschedule_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.NEEDS_HUMAN, message)
             return self._turn(run_id, [message])
         exclude = {conflict.slot_start, proposal.slot_start}
@@ -598,6 +620,51 @@ class Conversation:
         )
 
     # -- hold and approval --------------------------------------------------
+
+    def _handle_reviews(self, run_id: str, text: str) -> TurnResult:
+        run = self.store.require_run(run_id)
+        options = run.options
+        if not options:
+            raise ConversationError("no provider options are stored for this run")
+
+        index = parse_review_selection(text, len(options))
+        if index is None:
+            index = self._match_provider(review_name_query(text), options)
+        if index is None:
+            message = self._draft(run_id, "ask_review_provider", {})
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message], options=options)
+        return self._show_reviews(run_id, options[index], options)
+
+    def _show_reviews(
+        self, run_id: str, option: ProviderOption, options: list[ProviderOption]
+    ) -> TurnResult:
+        details = self.toolbox.call(run_id, "get_provider", provider_id=option.provider_id)
+        quotes = [
+            quote_review(review["author"], int(review["rating"]), review["text"])
+            for review in details.reviews
+        ]
+        self.runtime.trace(
+            run_id,
+            "reviews_shown",
+            {
+                "provider_id": details.provider_id,
+                "provider_name": details.name,
+                "untrusted": True,
+                "review_count": len(quotes),
+                "contains_instructions": [
+                    quote.author for quote in quotes if quote.contains_instructions
+                ],
+                "policy_material": policy_material(quotes),
+            },
+        )
+        message = self._draft(
+            run_id,
+            "reviews",
+            {"provider_name": details.name, "quotes": quotes},
+        )
+        self.runtime.assistant_message(run_id, message)
+        return self._turn(run_id, [message], options=options)
 
     def _select_option(self, run_id: str, text: str) -> TurnResult:
         run = self.store.require_run(run_id)
@@ -943,9 +1010,7 @@ class Conversation:
             )
             result = self.guard.execute_cancel(proposal.id, approval.id)
         except ApprovalExpired:
-            message = self._draft(
-                run_id, "cancel_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "cancel_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except ApprovalConsumed:
@@ -963,9 +1028,7 @@ class Conversation:
                     {"booking_id": booking.id, "proposal_id": proposal.id},
                 )
                 return self._turn(run_id, [message], booking=booking)
-            message = self._draft(
-                run_id, "cancel_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "cancel_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except ApprovalRequired:
@@ -973,34 +1036,24 @@ class Conversation:
             self.runtime.assistant_message(run_id, message)
             return self._turn(run_id, [message])
         except ApprovalInvalid:
-            message = self._draft(
-                run_id, "cancel_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "cancel_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except ExecutionInProgress:
-            message = self._draft(
-                run_id, "recovery_parked", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "recovery_parked", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except VerificationFailed:
-            message = self._draft(
-                run_id, "recovery_parked", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "recovery_parked", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.NEEDS_HUMAN, message)
             return self._turn(run_id, [message])
         except CancelFailed:
-            message = self._draft(
-                run_id, "cancel_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "cancel_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
 
         if result.booking is None:
-            message = self._draft(
-                run_id, "cancel_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "cancel_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         message = self._draft(
@@ -1026,9 +1079,7 @@ class Conversation:
         except RescheduleConflict as exc:
             return self._repropose_after_conflict(run_id, proposal, exc)
         except ApprovalExpired:
-            message = self._draft(
-                run_id, "reschedule_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "reschedule_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except ApprovalConsumed:
@@ -1046,9 +1097,7 @@ class Conversation:
                     {"booking_id": booking.id, "proposal_id": proposal.id},
                 )
                 return self._turn(run_id, [message], booking=booking)
-            message = self._draft(
-                run_id, "reschedule_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "reschedule_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except ApprovalRequired:
@@ -1056,34 +1105,24 @@ class Conversation:
             self.runtime.assistant_message(run_id, message)
             return self._turn(run_id, [message])
         except ApprovalInvalid:
-            message = self._draft(
-                run_id, "reschedule_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "reschedule_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except ExecutionInProgress:
-            message = self._draft(
-                run_id, "recovery_parked", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "recovery_parked", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except VerificationFailed:
-            message = self._draft(
-                run_id, "recovery_parked", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "recovery_parked", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.NEEDS_HUMAN, message)
             return self._turn(run_id, [message])
         except ExecutionFailed:
-            message = self._draft(
-                run_id, "reschedule_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "reschedule_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
 
         if result.booking is None:
-            message = self._draft(
-                run_id, "reschedule_failed", {"trace_path": run.trace_path}
-            )
+            message = self._draft(run_id, "reschedule_failed", {"trace_path": run.trace_path})
             self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         message = self._draft(
@@ -1104,9 +1143,7 @@ class Conversation:
     def _begin_booking_search(self, run_id: str, *, reason: str) -> None:
         run = self.store.require_run(run_id)
         if run.state == RunState.OPTIONS_READY:
-            self.runtime.transition(
-                run_id, RunState.COLLECTING, reason="restart booking selection"
-            )
+            self.runtime.transition(run_id, RunState.COLLECTING, reason="restart booking selection")
         self.runtime.transition(run_id, RunState.SEARCHING, reason=reason)
 
     def _active_bookings(self, run_id: str, user_id: str) -> list[WorldBooking]:
@@ -1159,6 +1196,66 @@ class Conversation:
 
     # -- helpers ------------------------------------------------------------
 
+    def _limit_reached(self, run_id: str, reason: str) -> TurnResult:
+        run = self.store.require_run(run_id)
+        usage = self.budget.usage(run_id)
+        self.runtime.trace(
+            run_id,
+            "budget",
+            {"limit": reason, **usage.as_dict()},
+        )
+        labels = {
+            "model_turns": "model turn cap",
+            "tool_calls": "tool call cap",
+            "wall_clock": "wall-clock cap",
+            "turn_timeout": "per-turn time cap",
+        }
+        label = labels.get(reason, reason)
+        try:
+            message = self.model.draft(
+                DraftRequest(
+                    kind="limit_reached",
+                    data={
+                        "limit_label": label,
+                        "trace_path": run.trace_path,
+                    },
+                    run_id=run_id,
+                )
+            )
+        except Exception:
+            message = (
+                f"I stopped at a safety limit ({label}) before finishing. "
+                "No booking was made and nothing was changed.\n"
+                f"Trace: {run.trace_path}"
+            )
+        self.runtime.finish(
+            run_id,
+            RunState.LIMIT_REACHED,
+            message,
+            {
+                "limit": reason,
+                "budget": usage.as_dict(),
+                "no_booking": True,
+            },
+        )
+        return self._turn(run_id, [message])
+
+    def _unknown_failure(self, run_id: str, exc: Exception) -> TurnResult:
+        run = self.store.require_run(run_id)
+        message = (
+            "I stopped because of an unexpected error. No success is claimed for "
+            "this run, and nothing else will run in this session.\n"
+            f"Trace: {run.trace_path}"
+        )
+        self.runtime.finish(
+            run_id,
+            RunState.FAILED,
+            message,
+            {"error_type": type(exc).__name__, "no_stack_trace": True},
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return self._turn(run_id, [message])
+
     def _match_provider(self, text: str, options: list[ProviderOption]) -> int | None:
         normalized = text.strip().lower()
         if not normalized:
@@ -1171,7 +1268,8 @@ class Conversation:
         return None
 
     def _draft(self, run_id: str, kind: str, data: dict[str, object]) -> str:
-        message = self.model.draft(DraftRequest(kind=kind, data=data))
+        self.budget.spend_model_turn(run_id)
+        message = self.model.draft(DraftRequest(kind=kind, data=data, run_id=run_id))
         prompt_material = kind + json.dumps(data, default=str, sort_keys=True)
         self.runtime.trace(
             run_id,

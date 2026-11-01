@@ -27,6 +27,7 @@ from errand_agent.models import (
     RequiredSlot,
     TimeWindow,
 )
+from errand_agent.reviews import render_review_quotes
 from errand_agent.world import WorldBooking
 
 SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -68,10 +69,23 @@ class ExtractionContext:
 class DraftRequest:
     kind: str
     data: dict[str, Any]
+    run_id: str = ""
 
 
 class ScriptedModel:
     name = "scripted-v1"
+
+    def __init__(self) -> None:
+        self._tool_provider: Any = None
+
+    def bind_tools(self, provider: Any) -> None:
+        """Bind a per-run, fail-closed model tool surface."""
+        self._tool_provider = provider
+
+    def tools(self, run_id: str) -> Any:
+        if self._tool_provider is None:
+            raise RuntimeError("no model tool surface is bound")
+        return self._tool_provider(run_id)
 
     @staticmethod
     def extract_action(text: str) -> Action:
@@ -214,6 +228,16 @@ class ScriptedModel:
             return (
                 f"I couldn't find any {data['service']}s in {data['area']} for "
                 f"{data['time_label']}. Try another area or time."
+            )
+        if request.kind == "reviews":
+            return render_review_quotes(data["provider_name"], data["quotes"])
+        if request.kind == "ask_review_provider":
+            return "Which provider's reviews? Reply with a provider number."
+        if request.kind == "limit_reached":
+            return (
+                f"I stopped at a safety limit ({data['limit_label']}) before finishing. "
+                "No booking was made and nothing was changed.\n"
+                f"Trace: {data['trace_path']}"
             )
         if request.kind == "approval":
             return self._draft_approval(data["card"])

@@ -50,11 +50,16 @@ class Runtime:
         state: RunState,
         message: str,
         extra: dict[str, Any] | None = None,
+        *,
+        error: str | None = None,
     ) -> None:
         run = self.store.require_run(run_id)
         if not is_terminal(run.state) and run.state != state:
             self.transition(run_id, state, reason="run finished")
         run = self.store.require_run(run_id)
+        if error is not None:
+            self.store.update_run_state(run_id, run.state, self.clock.now(), error=error)
+            run = self.store.require_run(run_id)
         self.assistant_message(run_id, message)
         if not any(
             event["type"] == "run_finished" for event in self.store.list_trace_events(run_id)

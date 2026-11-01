@@ -207,6 +207,14 @@ class BookingRecord(BaseModel):
     created_at: datetime
 
 
+class RunBudget(BaseModel):
+    run_id: str
+    turns: int
+    tool_calls: int
+    turn_started_at: datetime
+    deadline_at: datetime
+
+
 class TurnResult(BaseModel):
     run_id: str
     state: RunState
