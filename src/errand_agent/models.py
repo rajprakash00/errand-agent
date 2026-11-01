@@ -69,6 +69,24 @@ class RequiredSlot(StrEnum):
     TIME_WINDOW = "time_window"
 
 
+class MemoryKey(StrEnum):
+    AREA = "area"
+    EARLIEST_TIME = "earliest_time"
+    PREFERRED_PROVIDER_ID = "preferred_provider_id"
+
+
+class FactProvenance(StrEnum):
+    STATED = "stated"
+    INFERRED = "inferred"
+
+
+class FactStatus(StrEnum):
+    ACTIVE = "active"
+    PENDING_CONFIRMATION = "pending_confirmation"
+    ARCHIVED = "archived"
+    FORGOTTEN = "forgotten"
+
+
 class TimeWindow(BaseModel):
     start: datetime
     end: datetime
@@ -215,6 +233,21 @@ class RunBudget(BaseModel):
     deadline_at: datetime
 
 
+class MemoryFact(BaseModel):
+    id: str
+    user_id: str
+    key: MemoryKey
+    value: str | None
+    provenance: FactProvenance
+    status: FactStatus
+    source_turn_id: str | None = None
+    confirmed_by: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    forgotten_at: datetime | None = None
+    tombstone_hash: str | None = None
+
+
 class TurnResult(BaseModel):
     run_id: str
     state: RunState
@@ -223,5 +256,6 @@ class TurnResult(BaseModel):
     options: list[ProviderOption] = Field(default_factory=list)
     approval: ApprovalCard | None = None
     booking: BookingRecord | None = None
+    memory: list[MemoryFact] = Field(default_factory=list)
     trace_path: str
     terminal: bool = False

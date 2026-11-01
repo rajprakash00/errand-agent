@@ -18,11 +18,13 @@ from errand_agent.formatting import (
     format_slot,
     format_slot_range,
 )
+from errand_agent.memory import InferredFact
 from errand_agent.models import (
     Action,
     ApprovalCard,
     BookingRecord,
     ErrandSlots,
+    MemoryKey,
     ProviderOption,
     RequiredSlot,
     TimeWindow,
@@ -72,6 +74,36 @@ class DraftRequest:
     run_id: str = ""
 
 
+@dataclass(frozen=True)
+class MemoryInferenceContext:
+    known_areas: tuple[str, ...]
+    known_providers: dict[str, str]
+
+
+HEDGE_WORDS = (
+    "usually",
+    "normally",
+    "typically",
+    "tend to",
+    "tends to",
+    "often",
+    "most of the time",
+    "probably",
+    "maybe",
+    "i guess",
+)
+
+INFERRED_TIME_WORDS: dict[str, str] = {
+    "early": "09:00",
+    "morning": "09:00",
+    "mornings": "09:00",
+    "afternoon": "12:00",
+    "afternoons": "12:00",
+    "evening": "17:00",
+    "evenings": "17:00",
+}
+
+
 class ScriptedModel:
     name = "scripted-v1"
 
@@ -118,6 +150,24 @@ class ScriptedModel:
         if window:
             slots.time_window = window
         return slots
+
+    def infer_facts(
+        self, text: str, context: MemoryInferenceContext
+    ) -> list[InferredFact]:
+        """Suggest a preference from hedged language. Never creates a stated fact."""
+        lowered = text.lower()
+        if not any(hedge in lowered for hedge in HEDGE_WORDS):
+            return []
+        for word, value in INFERRED_TIME_WORDS.items():
+            if re.search(rf"\b{re.escape(word)}\b", lowered):
+                return [
+                    InferredFact(
+                        key=MemoryKey.EARLIEST_TIME,
+                        value=value,
+                        reason=f"hedged language mentioned '{word}'",
+                    )
+                ]
+        return []
 
     @staticmethod
     def _extract_service(text: str) -> str | None:

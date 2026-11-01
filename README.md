@@ -2,11 +2,12 @@
 
 A local, offline errand booking agent with a code-enforced approval kernel.
 
-This repository currently implements tickets 01–06: a scripted CLI errand from
+This repository currently implements tickets 01–07: a scripted CLI errand from
 the first request to a verified booking, approval invalidation and hold expiry,
 timeout reconciliation with restart recovery, cancel/reschedule, untrusted
-review handling with injection defense, and bounded execution with clear exits,
-with SQLite persistence and a JSONL trace.
+review handling with injection defense, bounded execution with clear exits, and
+memory with provenance and tombstones, with SQLite persistence and a JSONL
+trace.
 
 ## Run
 
@@ -83,6 +84,23 @@ Use `uv run errand chat` for an interactive session. The chat startup resolves
 any intents a previous process left in flight. In the options step, ask for
 `reviews for 2` (Ravi Plumbing Works) to see the seeded injected review.
 
+Memory scenarios and commands:
+
+```bash
+uv run errand demo --scenario memory
+uv run errand memory list
+uv run errand memory remember area Indiranagar
+uv run errand memory correct area Koramangala
+uv run errand memory confirm earliest_time
+uv run errand memory forget area
+```
+
+The memory demo saves an area in session one, uses it in session two without
+asking, shows a hedged "mornings" preference as inferred and pending, proves
+that the pending fact is not used, confirms it, forgets the area, and starts a
+fresh session that asks for the area again. Replaying the old chat message does
+not restore the forgotten area. `memory list --all` also shows tombstones.
+
 ## What is enforced
 
 - The proposal is immutable and hashed over `user_id`, `action`, `booking_id`,
@@ -121,6 +139,12 @@ any intents a previous process left in flight. In the options step, ask for
   persisted per run. Exhaustion ends at `limit_reached` with the trace ID and a
   no-booking statement. Unexpected errors end at `failed` with a clear message
   and no stack trace. Both write a final `run_finished` trace event.
+- Memory is keyed by user, not by run. Only the deterministic parser creates a
+  `stated` fact. A hedged model suggestion is `inferred` and starts as
+  `pending_confirmation`; the search does not use it until the user confirms.
+  Corrections archive the old value. Forget deletes the value, marks the fact
+  `forgotten`, and writes a tombstone hash. A replayed old message cannot
+  resurrect it, and a new session never reads it.
 - Every run writes a JSONL trace plus an indexed copy of the events in SQLite.
   Timeout runs show `book` error → `get_booking_status` → `reconciliation` →
   `run_finished`.

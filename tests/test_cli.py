@@ -201,6 +201,69 @@ def test_demo_turn_limit_shows_limit_reached_and_no_booking(tmp_path, capsys, re
     assert events[-1]["payload"]["no_booking"] is True
 
 
+def test_demo_memory_scenario_shows_pending_confirmation_and_tombstone(
+    tmp_path, capsys, read_trace
+) -> None:
+    data_dir = tmp_path / "data"
+    code = main(["demo", "--data-dir", str(data_dir), "--scenario", "memory"])
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "area = Indiranagar (stated, active)" in captured.out
+    assert (
+        "earliest_time = 09:00 (mornings) (inferred, pending_confirmation)"
+        in captured.out
+    )
+    assert "earliest_time = 09:00 (inferred, active)" in captured.out
+    assert "area = (forgotten) (stated, forgotten)" in captured.out
+    assert "Which area should I search in?" in captured.out
+    assert "Memory demo passed." in captured.out
+
+    traces = list((data_dir / "memory-demo" / "traces").glob("*.jsonl"))
+    assert len(traces) >= 4
+    events = [event for path in traces for event in read_trace(path)]
+    assert any(
+        event["type"] == "memory_write"
+        and event["payload"].get("provenance") == "inferred"
+        for event in events
+    )
+    assert any(
+        event["type"] == "memory_read" and event["payload"].get("used") is False
+        for event in events
+    )
+    assert any(
+        event["type"] == "memory_read" and event["payload"].get("used") is True
+        for event in events
+    )
+
+
+def test_memory_cli_round_trip(tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+
+    assert (
+        main(["memory", "--data-dir", str(data_dir), "remember", "area", "Indiranagar"])
+        == 0
+    )
+    assert "area = Indiranagar (stated, active)" in capsys.readouterr().out
+
+    assert (
+        main(
+            ["memory", "--data-dir", str(data_dir), "correct", "area", "Koramangala"]
+        )
+        == 0
+    )
+    assert "area = Koramangala (stated, active)" in capsys.readouterr().out
+
+    assert main(["memory", "--data-dir", str(data_dir), "forget", "area"]) == 0
+    assert "area = (forgotten) (stated, forgotten)" in capsys.readouterr().out
+
+    assert main(["memory", "--data-dir", str(data_dir), "list"]) == 0
+    assert "No saved preferences." in capsys.readouterr().out
+
+    assert main(["memory", "--data-dir", str(data_dir), "list", "--all"]) == 0
+    assert "area = (forgotten) (stated, forgotten)" in capsys.readouterr().out
+
+
 def test_demo_unknown_error_shows_a_clear_failure(tmp_path, capsys, read_trace) -> None:
     data_dir = tmp_path / "data"
     code = main(["demo", "--data-dir", str(data_dir), "--scenario", "unknown-error"])

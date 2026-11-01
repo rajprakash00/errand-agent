@@ -8,7 +8,7 @@ from errand_agent.clock import Clock
 from errand_agent.db import Store
 from errand_agent.dialogue import is_terminal, transition
 from errand_agent.ids import new_id
-from errand_agent.models import RunState
+from errand_agent.models import MessageRecord, RunState
 from errand_agent.trace import Tracer
 
 
@@ -35,10 +35,11 @@ class Runtime:
         )
         return checked
 
-    def user_message(self, run_id: str, text: str) -> None:
+    def user_message(self, run_id: str, text: str) -> MessageRecord:
         now = self.clock.now()
-        self.store.add_message(new_id("msg"), run_id, "user", text, now)
+        message = self.store.add_message(new_id("msg"), run_id, "user", text, now)
         self.trace(run_id, "user_message", {"text": text})
+        return message
 
     def assistant_message(self, run_id: str, text: str) -> None:
         now = self.clock.now()
