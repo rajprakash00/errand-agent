@@ -14,6 +14,8 @@ ALLOWED_TOOLS = frozenset(
         "get_provider",
         "hold_slot",
         "book",
+        "cancel",
+        "reschedule",
         "get_booking_status",
         "list_bookings",
     }
@@ -30,7 +32,7 @@ class Toolbox:
         delta = self.clock.now() - start
         return max(0, int(delta.total_seconds() * 1000))
 
-    def call(self, run_id: str, name: str, **kwargs: Any) -> Any:
+    def call(self, run_id: str, name: str, *, attempt: int = 1, **kwargs: Any) -> Any:
         if name not in ALLOWED_TOOLS:
             raise ValueError(f"tool is not exposed to the kernel: {name}")
         start = self.clock.now()
@@ -44,7 +46,7 @@ class Toolbox:
                     "name": name,
                     "args": kwargs,
                     "error": f"{type(exc).__name__}: {exc}",
-                    "attempt": 1,
+                    "attempt": attempt,
                 },
                 latency_ms=self._latency_ms(start),
             )
@@ -52,7 +54,7 @@ class Toolbox:
         self.tracer.event(
             run_id,
             "tool_call",
-            {"name": name, "args": kwargs, "result": result, "attempt": 1},
+            {"name": name, "args": kwargs, "result": result, "attempt": attempt},
             latency_ms=self._latency_ms(start),
         )
         return result

@@ -473,6 +473,22 @@ class SlotTaken(WorldError):
     pass
 
 
+class ProviderTimeout(WorldError):
+    """The provider did not answer, so the outcome is unknown."""
+
+
+class TransientError(WorldError):
+    """A transient 503. The same request must be retried with the same key."""
+
+
+class SlotConflict(WorldError):
+    """A reschedule target conflicts with another booking."""
+
+
+class ProcessCrash(Exception):
+    """Simulates the agent process dying between the intent write and the result."""
+
+
 class MockProviderWorld:
     """A deterministic, in-process provider world.
 
@@ -498,6 +514,13 @@ class MockProviderWorld:
         self._booked_slots: set[tuple[str, datetime]] = set()
         self._bookings_by_key: dict[str, WorldBooking] = {}
         self._bookings: list[WorldBooking] = []
+        self._timeout_plan: list[bool] = []
+        self._crash_plan: list[bool] = []
+        self._cancel_keys: dict[str, str] = {}
+        self._reschedule_keys: dict[str, str] = {}
+        self._cancel_transient_seen: set[str] = set()
+        self._forced_cancel_failures = 0
+        self._reschedule_conflicts: set[tuple[str, datetime]] = set()
         self.calls: list[WorldCall] = []
 
     @staticmethod
@@ -527,6 +550,82 @@ class MockProviderWorld:
 
     def calls_named(self, name: str) -> list[WorldCall]:
         return [call for call in self.calls if call.name == name]
+
+    # -- deterministic fault controls (kernel-only, never model tools) ------
+
+    def fail_next_book(self, *, committed: bool) -> None:
+        """Make the next book call time out, after committing or without it."""
+        self._timeout_plan.append(committed)
+
+    def crash_next_book(self, *, committed: bool) -> None:
+        """Simulate the agent process dying mid-book, after an optional commit."""
+        self._crash_plan.append(committed)
+
+    def fail_next_cancel(self, times: int = 1) -> None:
+        """Force transient cancel failures before the built-in first-call 503."""
+        self._forced_cancel_failures += times
+
+    def configure_reschedule_conflict(self, provider_id: str, slot_start: datetime) -> None:
+        self._reschedule_conflicts.add((provider_id, slot_start))
+
+    def seed_booking(
+        self,
+        provider_id: str,
+        slot_start: datetime,
+        *,
+        slot_end: datetime | None = None,
+        user_id: str | None = None,
+        price_inr: int | None = None,
+    ) -> WorldBooking:
+        """Create an existing booking, as if the user had booked before this run."""
+        provider = self._provider(provider_id)
+        if slot_end is None:
+            slot_end = slot_start + timedelta(minutes=SLOT_MINUTES)
+        if (provider_id, slot_start) in self._booked_slots:
+            raise SlotTaken("slot is already booked")
+        key = new_id("seedkey")
+        booking = WorldBooking(
+            id=new_id("bk"),
+            user_id=user_id or self.user_id,
+            provider_id=provider.id,
+            provider_name=provider.name,
+            slot_start=slot_start,
+            slot_end=slot_end,
+            price_inr=provider.price_inr if price_inr is None else price_inr,
+            idempotency_key=key,
+        )
+        self._bookings_by_key[key] = booking
+        self._bookings.append(booking)
+        self._booked_slots.add((provider.id, slot_start))
+        self._record(
+            "seed_booking",
+            {"provider_id": provider_id, "slot_start": slot_start, "user_id": booking.user_id},
+            result=booking,
+        )
+        return booking
+
+    def _booking_by_id(self, booking_id: str) -> WorldBooking | None:
+        for booking in self._bookings:
+            if booking.id == booking_id:
+                return booking
+        return None
+
+    def _commit_booking(self, hold: Hold, idempotency_key: str) -> WorldBooking:
+        booking = WorldBooking(
+            id=new_id("bk"),
+            user_id=hold.user_id,
+            provider_id=hold.provider_id,
+            provider_name=hold.provider_name,
+            slot_start=hold.slot_start,
+            slot_end=hold.slot_end,
+            price_inr=hold.quoted_price_inr,
+            idempotency_key=idempotency_key,
+        )
+        self._bookings_by_key[idempotency_key] = booking
+        self._bookings.append(booking)
+        self._booked_slots.add((hold.provider_id, hold.slot_start))
+        self._held_slots.pop((hold.provider_id, hold.slot_start), None)
+        return booking
 
     def _record(
         self,
@@ -765,24 +864,112 @@ class MockProviderWorld:
                 raise HoldExpired("hold has expired")
             if (hold.provider_id, hold.slot_start) in self._booked_slots:
                 raise SlotTaken("slot was taken before the booking call")
-            booking = WorldBooking(
-                id=new_id("bk"),
-                user_id=hold.user_id,
-                provider_id=hold.provider_id,
-                provider_name=hold.provider_name,
-                slot_start=hold.slot_start,
-                slot_end=hold.slot_end,
-                price_inr=hold.quoted_price_inr,
-                idempotency_key=idempotency_key,
-            )
-            self._bookings_by_key[idempotency_key] = booking
-            self._bookings.append(booking)
-            self._booked_slots.add((hold.provider_id, hold.slot_start))
-            self._held_slots.pop((hold.provider_id, hold.slot_start), None)
+
+            if self._crash_plan:
+                committed = self._crash_plan.pop(0)
+                if committed:
+                    self._commit_booking(hold, idempotency_key)
+                raise ProcessCrash("the agent process died before the booking result")
+            if self._timeout_plan:
+                committed = self._timeout_plan.pop(0)
+                if committed:
+                    self._commit_booking(hold, idempotency_key)
+                raise ProviderTimeout(
+                    "booking call timed out after the provider committed"
+                    if committed
+                    else "booking call timed out before the provider committed"
+                )
+
+            booking = self._commit_booking(hold, idempotency_key)
             self._record("book", args, result=booking)
             return booking
         except Exception as exc:
             self._record("book", args, error=str(exc))
+            raise
+
+    def cancel(self, booking_id: str, idempotency_key: str) -> WorldBooking:
+        args = {"booking_id": booking_id, "idempotency_key": idempotency_key}
+        try:
+            seen = self._cancel_keys.get(idempotency_key)
+            if seen is not None:
+                booking = self._booking_by_id(seen)
+                if booking is None:
+                    raise WorldError(f"unknown booking: {seen}")
+                self._record("cancel", args, result=booking)
+                return booking
+
+            booking = self._booking_by_id(booking_id)
+            if booking is None:
+                raise WorldError(f"unknown booking: {booking_id}")
+            if booking.status == "cancelled":
+                self._cancel_keys[idempotency_key] = booking.id
+                self._record("cancel", args, result=booking)
+                return booking
+
+            if self._forced_cancel_failures > 0:
+                self._forced_cancel_failures -= 1
+                raise TransientError("503 Service Unavailable: cancel did not complete")
+
+            # The fixed contract: the first cancel call for a booking is a
+            # transient 503; a retry with the same key succeeds.
+            if booking.id not in self._cancel_transient_seen:
+                self._cancel_transient_seen.add(booking.id)
+                raise TransientError("503 Service Unavailable: retry the same request")
+
+            booking.status = "cancelled"
+            self._booked_slots.discard((booking.provider_id, booking.slot_start))
+            self._cancel_keys[idempotency_key] = booking.id
+            self._record("cancel", args, result=booking)
+            return booking
+        except Exception as exc:
+            self._record("cancel", args, error=str(exc))
+            raise
+
+    def reschedule(
+        self,
+        booking_id: str,
+        new_slot: datetime,
+        idempotency_key: str,
+    ) -> WorldBooking:
+        args = {
+            "booking_id": booking_id,
+            "new_slot": new_slot,
+            "idempotency_key": idempotency_key,
+        }
+        try:
+            seen = self._reschedule_keys.get(idempotency_key)
+            if seen is not None:
+                booking = self._booking_by_id(seen)
+                if booking is None:
+                    raise WorldError(f"unknown booking: {seen}")
+                self._record("reschedule", args, result=booking)
+                return booking
+
+            booking = self._booking_by_id(booking_id)
+            if booking is None:
+                raise WorldError(f"unknown booking: {booking_id}")
+            if booking.status != "confirmed":
+                raise WorldError(f"booking {booking_id} is {booking.status}")
+            if (booking.provider_id, new_slot) in self._reschedule_conflicts:
+                raise SlotConflict("the new slot conflicts with another booking")
+            if (booking.provider_id, new_slot) in self._booked_slots:
+                raise SlotConflict("the new slot is already booked")
+
+            provider = self._provider(booking.provider_id)
+            quoted_price, _ = self._quote_overrides.get(
+                (provider.id, new_slot), (provider.price_inr, 1)
+            )
+            self._booked_slots.discard((booking.provider_id, booking.slot_start))
+            self._booked_slots.add((booking.provider_id, new_slot))
+            self._held_slots.pop((booking.provider_id, new_slot), None)
+            booking.slot_start = new_slot
+            booking.slot_end = new_slot + timedelta(minutes=SLOT_MINUTES)
+            booking.price_inr = quoted_price
+            self._reschedule_keys[idempotency_key] = booking.id
+            self._record("reschedule", args, result=booking)
+            return booking
+        except Exception as exc:
+            self._record("reschedule", args, error=str(exc))
             raise
 
     def get_booking_status(self, idempotency_key: str) -> StatusResult:
@@ -799,7 +986,11 @@ class MockProviderWorld:
     def list_bookings(self, user_id: str) -> list[WorldBooking]:
         args = {"user_id": user_id}
         bookings = sorted(
-            (booking for booking in self._bookings if booking.user_id == user_id),
+            (
+                booking
+                for booking in self._bookings
+                if booking.user_id == user_id and booking.status == "confirmed"
+            ),
             key=lambda booking: booking.slot_start,
         )
         self._record("list_bookings", args, result=bookings)

@@ -30,6 +30,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
+    action TEXT NOT NULL DEFAULT 'book',
     state TEXT NOT NULL,
     slots_json TEXT NOT NULL DEFAULT '{}',
     options_json TEXT NOT NULL DEFAULT '[]',
@@ -74,7 +75,7 @@ CREATE TABLE IF NOT EXISTS proposals (
     slot_end TEXT NOT NULL,
     quoted_price_inr INTEGER NOT NULL,
     quote_version INTEGER NOT NULL,
-    hold_id TEXT NOT NULL REFERENCES holds(id),
+    hold_id TEXT REFERENCES holds(id),
     expires_at TEXT NOT NULL,
     state TEXT NOT NULL,
     binding_hash TEXT NOT NULL,
@@ -150,6 +151,65 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring a database written by an earlier ticket up to the current schema."""
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            run_columns = {
+                row["name"]: row for row in self.conn.execute("PRAGMA table_info(runs)")
+            }
+            if "action" not in run_columns:
+                self.conn.execute(
+                    "ALTER TABLE runs ADD COLUMN action TEXT NOT NULL DEFAULT 'book'"
+                )
+
+            proposal_columns = {
+                row["name"]: row for row in self.conn.execute("PRAGMA table_info(proposals)")
+            }
+            hold_column = proposal_columns.get("hold_id")
+            if hold_column is not None and hold_column["notnull"]:
+                # A cancel proposal has no provider hold, so hold_id must be
+                # nullable. SQLite cannot drop NOT NULL in place.
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self.conn.execute(
+                        """
+                        CREATE TABLE proposals_new (
+                            id TEXT PRIMARY KEY,
+                            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                            user_id TEXT NOT NULL,
+                            action TEXT NOT NULL,
+                            booking_id TEXT,
+                            provider_id TEXT NOT NULL,
+                            slot_start TEXT NOT NULL,
+                            slot_end TEXT NOT NULL,
+                            quoted_price_inr INTEGER NOT NULL,
+                            quote_version INTEGER NOT NULL,
+                            hold_id TEXT REFERENCES holds(id),
+                            expires_at TEXT NOT NULL,
+                            state TEXT NOT NULL,
+                            binding_hash TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        "INSERT INTO proposals_new SELECT id, run_id, user_id, action, "
+                        "booking_id, provider_id, slot_start, slot_end, quoted_price_inr, "
+                        "quote_version, hold_id, expires_at, state, binding_hash, "
+                        "created_at, updated_at FROM proposals"
+                    )
+                    self.conn.execute("DROP TABLE proposals")
+                    self.conn.execute("ALTER TABLE proposals_new RENAME TO proposals")
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def close(self) -> None:
         self.conn.close()
@@ -180,11 +240,12 @@ class Store:
         state: RunState,
         trace_path: str,
         now: datetime,
+        action: Action = Action.BOOK,
     ) -> RunRecord:
         self.conn.execute(
-            "INSERT INTO runs (id, user_id, state, trace_path, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (run_id, user_id, state.value, trace_path, _iso(now), _iso(now)),
+            "INSERT INTO runs (id, user_id, action, state, trace_path, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_id, user_id, action.value, state.value, trace_path, _iso(now), _iso(now)),
         )
         return self.require_run(run_id)
 
@@ -196,6 +257,7 @@ class Store:
         return RunRecord(
             id=row["id"],
             user_id=row["user_id"],
+            action=Action(row["action"]),
             state=RunState(row["state"]),
             slots=ErrandSlots.model_validate_json(row["slots_json"]),
             options=options,
@@ -505,6 +567,14 @@ class Store:
             return None
         return self._intent_from_row(row)
 
+    def list_unsettled_intents(self) -> list[IntentRecord]:
+        """Intents that a previous process left in flight or unknown."""
+        rows = self.conn.execute(
+            "SELECT * FROM intents WHERE state IN (?, ?) ORDER BY created_at",
+            (IntentState.IN_FLIGHT.value, IntentState.UNKNOWN.value),
+        ).fetchall()
+        return [self._intent_from_row(row) for row in rows]
+
     def _intent_from_row(self, row: sqlite3.Row) -> IntentRecord:
         return IntentRecord(
             id=row["id"],
@@ -574,6 +644,30 @@ class Store:
         if row is None:
             return None
         return self._booking_from_row(row)
+
+    def get_booking_by_id(self, booking_id: str) -> BookingRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM bookings WHERE id = ?", (booking_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._booking_from_row(row)
+
+    def update_booking_status(self, booking_id: str, status: str) -> None:
+        self.conn.execute("UPDATE bookings SET status = ? WHERE id = ?", (status, booking_id))
+
+    def update_booking_schedule(
+        self,
+        booking_id: str,
+        *,
+        slot_start: datetime,
+        slot_end: datetime,
+        price_inr: int,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE bookings SET slot_start = ?, slot_end = ?, price_inr = ? WHERE id = ?",
+            (_iso(slot_start), _iso(slot_end), price_inr, booking_id),
+        )
 
     def get_booking_by_proposal(self, proposal_id: str) -> BookingRecord | None:
         row = self.conn.execute(
