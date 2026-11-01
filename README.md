@@ -2,12 +2,12 @@
 
 A local, offline errand booking agent with a code-enforced approval kernel.
 
-This repository currently implements tickets 01–07: a scripted CLI errand from
+This repository currently implements tickets 01–08: a scripted CLI errand from
 the first request to a verified booking, approval invalidation and hold expiry,
 timeout reconciliation with restart recovery, cancel/reschedule, untrusted
-review handling with injection defense, bounded execution with clear exits, and
-memory with provenance and tombstones, with SQLite persistence and a JSONL
-trace.
+review handling with injection defense, bounded execution with clear exits,
+memory with provenance and tombstones, and a browser chat with a live trace.
+Everything uses SQLite persistence and a JSONL trace.
 
 ## Run
 
@@ -21,7 +21,43 @@ The demo asks for the missing area, shows six plumbers in Indiranagar, holds the
 earliest slot for the chosen provider, prints the exact approval card, and books
 only after the typed `yes`. It prints the final run state and the trace path.
 
-Use `--scenario` to see an approval being invalidated and replaced:
+## Web UI
+
+```bash
+uv run errand serve
+```
+
+Open <http://127.0.0.1:8000>. The chat sits on the left and the live trace on
+the right; both stay side by side at 1280 px. The approval card shows the exact
+action, provider, slot, price, and hold expiry. The trace pane streams state
+transitions, model calls, tool calls, approvals, status checks, and
+reconciliation as they happen, and the download button returns the raw JSONL
+file for the run.
+
+The web UI calls the same conversation seam as the CLI. It uses the same
+approval path: the card's buttons send the same `yes` or `no` decision that the
+typed parser receives.
+
+To demonstrate reconciliation in the browser, start the server with the
+timeout-after-success fault:
+
+```bash
+uv run errand serve --scenario timeout-after-success
+```
+
+Complete the booking in the side-by-side layout. The trace shows the timeout,
+the `get_booking_status` check, the reconciliation event, and the verified
+booking. The scenario is injected at the approval boundary, so the first
+approval card is genuine. Other browser scenarios are `quote-change`,
+`slot-change`, `hold-expiry`, `timeout-before-success`, `reschedule-conflict`,
+`injection`, `limit-turns`, and `unknown-error`.
+
+Use `--host`, `--port`, and `--data-dir` to change the listener or the SQLite
+location. The server binds `127.0.0.1` by default and makes no external calls.
+The UI bundles Inter and Instrument Serif under the SIL Open Font License; their
+licenses are in `src/errand_agent/static/fonts/LICENSES.md`.
+
+Use `--scenario` with the demo command to see an approval being invalidated and replaced:
 
 ```bash
 uv run errand demo --scenario quote-change
