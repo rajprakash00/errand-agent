@@ -93,7 +93,9 @@ MEMORY_KEY_LABELS: dict[MemoryKey, str] = {
 
 MEMORY_KEY_HINTS: dict[MemoryKey, str] = {
     MemoryKey.AREA: "Used to fill the area when you do not name one.",
-    MemoryKey.EARLIEST_TIME: "Hides slots earlier than this time in a new search.",
+    MemoryKey.EARLIEST_TIME: (
+        "Filters out earlier slots once the agent knows your day or date range."
+    ),
     MemoryKey.PREFERRED_PROVIDER_ID: "Moves this provider to the top of a new search.",
 }
 

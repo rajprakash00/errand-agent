@@ -50,9 +50,10 @@ confirmation changes the next search.
 To see the full panel flow, chat `Remember that I live in Indiranagar`, start a
 plumber errand, then reply `I usually book the early slots`. Open **Memory**:
 the area is stated and active, the time is inferred and pending. Confirm the
-time, correct the area, then start a new errand without naming an area. The next
-search uses the corrected area and the confirmed earliest time. Forget the area
-and a new session asks for it again.
+time, correct the area, then start a new errand without naming an area but with
+a day, for example `I need a plumber this week`. The next search uses the
+corrected area and the confirmed earliest time. Forget the area and a new
+session asks for it again.
 
 To demonstrate reconciliation in the browser, start the server with the
 timeout-after-success fault:

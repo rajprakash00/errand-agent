@@ -294,6 +294,7 @@
       state.memory = data;
       renderMemory();
     } catch (error) {
+      console.error("Memory panel failed to load", error);
       if (!silent) showToast(error.message);
     }
   }
@@ -472,7 +473,7 @@
     } else {
       field = document.createElement("input");
       field.type = "text";
-      field.list = "memory-areas";
+      field.setAttribute("list", "memory-areas");
       field.maxLength = 120;
       field.autocomplete = "off";
       field.value = fact.value || "";
