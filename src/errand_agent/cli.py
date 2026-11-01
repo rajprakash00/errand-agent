@@ -37,13 +37,26 @@ def print_turn(user_text: str, turn: TurnResult) -> None:
     print(f"[state: {turn.state.value}]")
 
 
+RECORD_START = datetime(2026, 11, 2, 9, 0, tzinfo=IST)
+
+
 def run_demo(args: argparse.Namespace) -> int:
     if args.scenario == "memory":
+        if args.trace_out:
+            print("--trace-out is not supported for the memory demo.", file=sys.stderr)
+            return 1
         return run_memory_demo(args)
-    needs_clock = args.scenario in {"hold-expiry"}
-    demo_clock = FakeClock(datetime.now(IST)) if needs_clock else None
+    recording = args.trace_out is not None
+    if recording or args.scenario == "hold-expiry":
+        start = RECORD_START if recording else datetime.now(IST)
+        demo_clock = FakeClock(start)
+    else:
+        demo_clock = None
+    data_dir = Path(args.data_dir) / "record" if recording else Path(args.data_dir)
+    if recording:
+        shutil.rmtree(data_dir, ignore_errors=True)
     caps = BudgetCaps(turn_cap=1) if args.scenario == "limit-turns" else None
-    app = build_app(args.data_dir, user_id=args.user_id, clock=demo_clock, caps=caps)
+    app = build_app(data_dir, user_id=args.user_id, clock=demo_clock, caps=caps)
     try:
         print("Errand Agent — scripted demo")
         print(f"Scenario: {args.scenario}")
@@ -110,6 +123,11 @@ def run_demo(args: argparse.Namespace) -> int:
         print(f"\nBookings recorded: {len(active)}")
         print(f"Final state: {turn.state.value}")
         print(f"Trace: {turn.trace_path}")
+        if args.trace_out:
+            output = Path(args.trace_out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(turn.trace_path, output)
+            print(f"Recorded trace: {output.resolve()}")
         expected = {RunState.COMPLETED, RunState.CANCELLED}
         if args.scenario == "limit-turns":
             expected.add(RunState.LIMIT_REACHED)
@@ -379,6 +397,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         default="happy",
         help="fault or flow to run",
+    )
+    demo.add_argument(
+        "--trace-out",
+        default=None,
+        help="copy the run's raw JSONL trace to this path",
     )
     demo.set_defaults(handler=run_demo)
 

@@ -12,7 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from errand_agent.budget import BudgetCaps, BudgetKeeper
-from errand_agent.clock import Clock, FakeClock, SystemClock
+from errand_agent.clock import Clock, DemoClock, FakeClock, SystemClock
 from errand_agent.conversation import Conversation
 from errand_agent.db import Store
 from errand_agent.formatting import format_price, format_slot_range
@@ -185,8 +185,8 @@ def apply_demo_fault(
             f"{format_slot_range(new_start, new_end)}."
         )
     if scenario == "hold-expiry":
-        if not isinstance(clock, FakeClock):
-            raise RuntimeError("the hold-expiry scenario needs the fake clock")
+        if not isinstance(clock, (FakeClock, DemoClock)):
+            raise RuntimeError("the hold-expiry scenario needs an advanceable clock")
         clock.advance(minutes=HOLD_MINUTES + 1)
         return "[scenario] Time passes beyond the 10-minute hold expiry."
     if scenario == "timeout-after-success":
@@ -221,62 +221,130 @@ FAULT_SCENARIOS = frozenset(
     }
 )
 
-# Scenarios the web server can inject after the approval card is shown.
-WEB_SCENARIOS = frozenset(
-    {
+BOOKING_PROMPT = "I need a plumber to fix a leaking tap this week."
+CANCEL_PROMPT = "Cancel my booking."
+RESCHEDULE_PROMPT = "Move my booking to this week."
+
+
+@dataclass(frozen=True)
+class DemoScenario:
+    """One armable demo control exposed by the browser panel.
+
+    The catalog is presentation metadata only. Every fault still travels through
+    the same kernel-only controls used by the CLI and the eval harness.
+    """
+
+    key: str
+    label: str
+    summary: str
+    hint: str
+    prompt: str
+    seeds_booking: bool = False
+    forces_turn_cap: bool = False
+
+
+DEMO_SCENARIOS: tuple[DemoScenario, ...] = (
+    DemoScenario(
         "happy",
-        "quote-change",
-        "slot-change",
-        "hold-expiry",
+        "Happy path",
+        "No fault is injected. Use this for the full booking run.",
+        "Start the errand, add the area, choose a provider, and approve.",
+        BOOKING_PROMPT,
+    ),
+    DemoScenario(
         "timeout-after-success",
+        "Timeout after success",
+        "The booking call times out after the provider committed.",
+        "Approve once. The status check finds the booking and reconciles.",
+        BOOKING_PROMPT,
+    ),
+    DemoScenario(
         "timeout-before-success",
+        "Timeout before success",
+        "The booking call times out before the provider committed.",
+        "Approve once. The status is not_found, then the same key retries.",
+        BOOKING_PROMPT,
+    ),
+    DemoScenario(
+        "quote-change",
+        "Price change",
+        "The provider re-quotes after approval.",
+        "Approve once. The old card is void and a new quote is presented.",
+        BOOKING_PROMPT,
+    ),
+    DemoScenario(
+        "slot-change",
+        "Slot change",
+        "The provider moves the slot after approval.",
+        "Approve once. The old card is void and the new slot is presented.",
+        BOOKING_PROMPT,
+    ),
+    DemoScenario(
+        "hold-expiry",
+        "Hold expiry",
+        "The ten-minute hold expires before the booking.",
+        "Approve once. The agent re-holds the same slot and asks again.",
+        BOOKING_PROMPT,
+    ),
+    DemoScenario(
         "reschedule-conflict",
+        "Slot conflict",
+        "The approved reschedule slot is rejected by the provider.",
+        "A demo booking is seeded. Start the move and approve once; a new slot "
+        "and approval appear.",
+        RESCHEDULE_PROMPT,
+        seeds_booking=True,
+    ),
+    DemoScenario(
+        "restart-mid-booking",
+        "Restart mid-booking",
+        "The agent process dies after writing the intent.",
+        "Approve once. The web layer rebuilds the kernel over the same database "
+        "and recovers the booking.",
+        BOOKING_PROMPT,
+    ),
+    DemoScenario(
         "injection",
+        "Injected review",
+        "A provider review contains a prompt-injection attempt.",
+        "After the options appear, ask for reviews for 2. The hostile review is "
+        "quoted, not obeyed.",
+        BOOKING_PROMPT,
+    ),
+    DemoScenario(
+        "cancel",
+        "Cancel with retry",
+        "The first cancel call gets a transient 503.",
+        "A demo booking is seeded. Start the cancel and approve once; the same "
+        "key is retried.",
+        CANCEL_PROMPT,
+        seeds_booking=True,
+    ),
+    DemoScenario(
         "limit-turns",
+        "Turn cap",
+        "The model turn cap is forced to one for the next run.",
+        "Start the errand. It stops at limit_reached with no booking.",
+        BOOKING_PROMPT,
+        forces_turn_cap=True,
+    ),
+    DemoScenario(
         "unknown-error",
-    }
+        "Unknown error",
+        "The first provider search raises an unexpected error.",
+        "Start the errand and add the area. The run ends clearly with no stack "
+        "trace.",
+        BOOKING_PROMPT,
+    ),
 )
+
+DEMO_SCENARIO_BY_KEY = {scenario.key: scenario for scenario in DEMO_SCENARIOS}
+
+# Scenarios the web server can install from the demo panel or at startup.
+WEB_SCENARIOS = frozenset(DEMO_SCENARIO_BY_KEY)
 
 
 def scenario_summary(scenario: str) -> str:
     """One sentence that explains a demo scenario in the UI."""
-    summaries = {
-        "happy": "Booking flow only. No faults are injected.",
-        "quote-change": (
-            "The provider re-quotes after approval. The old approval is void and "
-            "a fresh one is requested."
-        ),
-        "slot-change": (
-            "The provider moves the slot after approval. The old approval is void "
-            "and a fresh one is requested."
-        ),
-        "hold-expiry": (
-            "The 10-minute hold expires before the booking, then the agent re-holds "
-            "the slot."
-        ),
-        "timeout-after-success": (
-            "The booking call times out after the provider commits. The agent checks "
-            "the status and reconciles instead of retrying."
-        ),
-        "timeout-before-success": (
-            "The booking call times out before the provider commits. The agent checks "
-            "the status, then retries once with the same key."
-        ),
-        "reschedule-conflict": (
-            "The approved reschedule slot is rejected. A new slot and a new approval "
-            "are presented."
-        ),
-        "injection": (
-            "Ask for reviews for provider 2 to see an untrusted review that tries to "
-            "instruct the agent."
-        ),
-        "limit-turns": (
-            "The model turn cap is forced to one. The run stops at limit_reached with "
-            "no booking."
-        ),
-        "unknown-error": (
-            "The first provider search raises an unexpected error. The run ends with "
-            "a clear failure and no stack trace."
-        ),
-    }
-    return summaries.get(scenario, "")
+    spec = DEMO_SCENARIO_BY_KEY.get(scenario)
+    return spec.summary if spec is not None else ""

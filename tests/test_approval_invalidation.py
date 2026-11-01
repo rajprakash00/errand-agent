@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from errand_agent.approval import ApprovalExpired, record_approval
+from errand_agent.clock import IST
 from errand_agent.models import ApprovalState, ProposalState, RunState
 
 
@@ -169,3 +172,30 @@ def test_approval_survives_sub_second_clock_precision(app, to_approval) -> None:
     assert done.state == RunState.COMPLETED
     assert done.booking is not None
     assert_one_booking(app)
+
+
+def test_hold_expiry_across_midnight_reholds_the_same_slot(
+    app, to_approval, clock
+) -> None:
+    """Regression for BUGS.md #5: a re-hold must not re-anchor slots to today."""
+    clock.set(datetime(2026, 11, 1, 23, 56, tzinfo=IST))
+    first = to_approval()
+    assert first.approval is not None
+    proposal = app.store.require_proposal(first.approval.proposal_id)
+
+    clock.advance(minutes=11)
+
+    turn = app.conversation.send_message(first.run_id, "yes")
+
+    assert turn.state == RunState.AWAITING_APPROVAL
+    assert turn.approval is not None
+    assert turn.approval.proposal_id != proposal.id
+    assert turn.approval.slot_start == proposal.slot_start
+    assert app.world.calls_named("book") == []
+
+    done = app.conversation.send_message(first.run_id, "yes")
+
+    assert done.state == RunState.COMPLETED
+    assert done.booking is not None
+    assert done.booking.slot_start == proposal.slot_start
+    assert_one_booking(app, slot_start=proposal.slot_start)

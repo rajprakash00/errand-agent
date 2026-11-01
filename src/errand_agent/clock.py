@@ -40,3 +40,22 @@ class FakeClock:
         if value.tzinfo is None:
             raise ValueError("FakeClock requires a timezone-aware value")
         self._now = value
+
+
+class DemoClock:
+    """Wall clock with a movable offset for deterministic demo faults.
+
+    The web demo runs on real time until a scenario needs time to pass, such as
+    the hold-expiry flow. ``advance`` shifts the clock forward without freezing
+    it, so the rest of the page keeps showing live timestamps.
+    """
+
+    def __init__(self, base: Clock | None = None) -> None:
+        self._base: Clock = base or SystemClock()
+        self._offset = timedelta(0)
+
+    def now(self) -> datetime:
+        return self._base.now() + self._offset
+
+    def advance(self, *, seconds: float = 0, minutes: float = 0, days: float = 0) -> None:
+        self._offset += timedelta(seconds=seconds, minutes=minutes, days=days)

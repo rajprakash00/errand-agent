@@ -18,6 +18,13 @@
     newErrand: document.getElementById("new-errand"),
     memoryButton: document.getElementById("memory-button"),
     memoryCount: document.getElementById("memory-count"),
+    demoButton: document.getElementById("demo-button"),
+    demoState: document.getElementById("demo-state"),
+    demoDialog: document.getElementById("demo-dialog"),
+    demoClose: document.getElementById("demo-close"),
+    demoSubtitle: document.getElementById("demo-subtitle"),
+    demoNote: document.getElementById("demo-note"),
+    demoList: document.getElementById("demo-list"),
     memoryDialog: document.getElementById("memory-dialog"),
     memoryClose: document.getElementById("memory-close"),
     memorySubtitle: document.getElementById("memory-subtitle"),
@@ -65,6 +72,8 @@
     chatPinned: true,
     memory: null,
     memoryBusy: false,
+    demo: null,
+    demoBusy: false,
   };
 
   const timeFormatter = new Intl.DateTimeFormat("en-IN", {
@@ -98,7 +107,11 @@
 
   function renderScenario() {
     const isDemo = config.scenario && config.scenario !== "happy";
-    if (!isDemo && !config.startup_notice) return;
+    if (!isDemo && !config.startup_notice) {
+      el.scenarioStrip.hidden = true;
+      el.scenarioStrip.replaceChildren();
+      return;
+    }
     el.scenarioStrip.hidden = false;
     el.scenarioStrip.replaceChildren();
 
@@ -157,6 +170,13 @@
     });
     el.memoryList.addEventListener("click", onMemoryClick);
     el.memoryList.addEventListener("submit", onMemorySubmit);
+
+    el.demoButton.addEventListener("click", openDemo);
+    el.demoClose.addEventListener("click", closeDemo);
+    el.demoDialog.addEventListener("click", (event) => {
+      if (event.target === el.demoDialog) closeDemo();
+    });
+    el.demoList.addEventListener("click", onDemoClick);
 
     el.tabChat.addEventListener("click", () => setMobileView("chat"));
     el.tabTrace.addEventListener("click", () => setMobileView("trace"));
@@ -670,6 +690,140 @@
   function afterMemoryChange() {
     if (state.runId && state.snapshot && !isDone(state.snapshot)) {
       void syncTrace(state.runId);
+    }
+  }
+
+  /* -- demo controls ----------------------------------------------------- */
+
+  async function loadDemo({ silent = false } = {}) {
+    try {
+      const data = await requestJSON("/api/demo");
+      state.demo = data;
+      syncDemoConfig(data);
+      renderDemo();
+    } catch (error) {
+      if (!silent) showToast(error.message);
+    }
+  }
+
+  function syncDemoConfig(data) {
+    config.scenario = data.scenario;
+    config.scenario_summary = data.summary;
+    config.startup_notice = data.notice || null;
+    el.demoState.hidden = !data.active;
+    el.demoButton.classList.toggle("has-pending", Boolean(data.active));
+    renderScenario();
+  }
+
+  function openDemo() {
+    if (!el.demoDialog.open) el.demoDialog.showModal();
+    if (state.demo) renderDemo();
+    void loadDemo();
+  }
+
+  function closeDemo() {
+    if (el.demoDialog.open) el.demoDialog.close();
+  }
+
+  function renderDemo() {
+    const data = state.demo;
+    el.demoSubtitle.textContent =
+      data && data.active
+        ? `Armed: ${data.label}. ${data.summary}`
+        : "Arm a deterministic fault, then run the errand.";
+    el.demoNote.hidden = !(data && data.notice);
+    el.demoNote.textContent = data && data.notice ? cleanNotice(data.notice) : "";
+    if (!data) return;
+    el.demoList.replaceChildren(
+      ...(data.scenarios || []).map((scenario) => demoRow(scenario, data.scenario))
+    );
+  }
+
+  function demoRow(scenario, activeKey) {
+    const item = document.createElement("li");
+    item.className = "demo-item";
+    const active = scenario.key === activeKey;
+    if (active) item.classList.add("is-active");
+
+    const head = document.createElement("div");
+    head.className = "demo-item-head";
+    const title = document.createElement("h3");
+    title.className = "demo-item-title";
+    title.textContent = scenario.label;
+    head.appendChild(title);
+    if (active) {
+      const badge = document.createElement("span");
+      badge.className = "memory-badge memory-badge-active";
+      badge.textContent = "Armed";
+      head.appendChild(badge);
+    }
+
+    const summary = document.createElement("p");
+    summary.className = "demo-item-summary";
+    summary.textContent = scenario.summary;
+
+    const hint = document.createElement("p");
+    hint.className = "demo-item-hint";
+    hint.textContent = scenario.hint;
+
+    const actions = document.createElement("div");
+    actions.className = "demo-item-actions";
+
+    const arm = document.createElement("button");
+    arm.type = "button";
+    arm.className = "button button-ghost button-sm";
+    arm.dataset.demoAction = "arm";
+    arm.dataset.demoKey = scenario.key;
+    arm.textContent = active ? "Re-arm" : "Arm";
+    arm.disabled = state.demoBusy;
+
+    const start = document.createElement("button");
+    start.type = "button";
+    start.className = "button button-primary button-sm";
+    start.dataset.demoAction = "start";
+    start.dataset.demoKey = scenario.key;
+    start.textContent = "Arm & start";
+    start.disabled = state.demoBusy;
+
+    actions.append(arm, start);
+    item.append(head, summary, hint, actions);
+    return item;
+  }
+
+  function onDemoClick(event) {
+    const target = event.target.closest("[data-demo-action]");
+    if (!target || target.disabled || state.demoBusy) return;
+    const key = target.dataset.demoKey;
+    if (!key) return;
+    const start = target.dataset.demoAction === "start";
+    void armScenario(key, { start });
+  }
+
+  async function armScenario(key, { start = false } = {}) {
+    if (state.demoBusy) return;
+    state.demoBusy = true;
+    renderDemo();
+    try {
+      const data = await requestJSON("/api/demo/scenario", { scenario: key });
+      const spec = (data.scenarios || []).find((item) => item.key === key);
+      state.demo = data;
+      syncDemoConfig(data);
+      renderDemo();
+      showToast(
+        data.active
+          ? `${data.label} armed. ${data.summary}`
+          : "Happy path armed. No fault is injected."
+      );
+      if (start && spec) {
+        closeDemo();
+        newErrand();
+        await startErrand(spec.prompt);
+      }
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      state.demoBusy = false;
+      renderDemo();
     }
   }
 

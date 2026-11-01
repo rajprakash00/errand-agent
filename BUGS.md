@@ -82,3 +82,26 @@ idle time, not a slow model turn.
 **Regression:** `tests/test_budgets.py::test_a_gap_between_user_turns_does_not_trip_the_turn_timeout`
 advances the clock five minutes between messages and asserts the run continues
 to `options_ready`.
+
+## 5. A re-hold failed when the clock crossed midnight
+
+**Found:** while running the timer-dependent suite during ticket 11, close to
+midnight IST.
+
+**Symptom:** The hold-expiry flow advanced the hold past its ten-minute expiry,
+then the agent tried to re-hold the same 09:00 slot. The hold failed with
+`slot was not available`, and the run parked at `needs_human` with no booking.
+The same flow passed during the day.
+
+**Cause:** `MockProviderWorld.hold_slot` validated an exact slot by rebuilding
+the provider's slot list relative to the current date. When the clock crossed
+midnight between the quote and the re-hold, the slot anchored to the previous
+day disappeared from the rebuilt list even though the slot was still free.
+
+**Fix:** `hold_slot` now checks the slot time against the provider's published
+times, the 30-minute lead time, and current availability. It no longer re-anchors
+the slot to "today", so a hold remains re-holdable across midnight.
+
+**Regression:** `tests/test_approval_invalidation.py::test_hold_expiry_across_midnight_reholds_the_same_slot`
+starts at 23:56, expires the hold, and asserts the same 09:00 slot is re-held
+and booked once.
