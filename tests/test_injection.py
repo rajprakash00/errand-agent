@@ -89,6 +89,17 @@ def test_injected_review_is_quoted_untrusted_and_cannot_act(make_app, read_trace
     assert payload["policy_material"]["text_included"] is False
     assert payload["contains_instructions"]
 
+    provider_calls = [
+        event["payload"]
+        for event in events
+        if event["type"] == "tool_call" and event["payload"].get("name") == "get_provider"
+    ]
+    assert provider_calls
+    traced_reviews = provider_calls[-1]["result"]["reviews"]
+    assert traced_reviews
+    assert all(review["untrusted"] is True for review in traced_reviews)
+    assert all(len(review["text"]) <= MAX_REVIEW_CHARS + 1 for review in traced_reviews)
+
     # The next legitimate selection still uses the quoted option and still
     # needs a fresh, explicit approval before anything is booked.
     approval_turn = app.conversation.send_message(options_turn.run_id, "2")

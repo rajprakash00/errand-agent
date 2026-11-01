@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from errand_agent.budget import BudgetKeeper
 from errand_agent.clock import Clock
+from errand_agent.reviews import sanitize_review_text
 from errand_agent.trace import Tracer
-from errand_agent.world import MockProviderWorld
+from errand_agent.world import MockProviderWorld, ProviderDetails
 
 ALLOWED_TOOLS = frozenset(
     {
@@ -40,6 +42,17 @@ class Toolbox:
         delta = self.clock.now() - start
         return max(0, int(delta.total_seconds() * 1000))
 
+    @staticmethod
+    def _trace_result(name: str, result: Any) -> Any:
+        """Keep untrusted review text bounded in the trace copy."""
+        if name == "get_provider" and isinstance(result, ProviderDetails):
+            data = dataclasses.asdict(result)
+            for review in data["reviews"]:
+                review["text"] = sanitize_review_text(str(review["text"]))
+                review["untrusted"] = True
+            return data
+        return result
+
     def call(self, run_id: str, name: str, *, attempt: int = 1, **kwargs: Any) -> Any:
         if name not in ALLOWED_TOOLS:
             raise ValueError(f"tool is not exposed to the kernel: {name}")
@@ -64,7 +77,12 @@ class Toolbox:
         self.tracer.event(
             run_id,
             "tool_call",
-            {"name": name, "args": kwargs, "result": result, "attempt": attempt},
+            {
+                "name": name,
+                "args": kwargs,
+                "result": self._trace_result(name, result),
+                "attempt": attempt,
+            },
             latency_ms=self._latency_ms(start),
         )
         return result
