@@ -44,13 +44,14 @@ def build_app(
     clock: Clock | None = None,
     user_id: str = "user_raj",
     caps: BudgetCaps | None = None,
+    model: ScriptedModel | None = None,
 ) -> App:
     resolved_clock = clock or SystemClock()
     path = Path(data_dir)
     store = Store(path / "errand.db")
     tracer = Tracer(path / "traces", store, resolved_clock)
     world = MockProviderWorld(resolved_clock, user_id=user_id)
-    model = ScriptedModel()
+    resolved_model = model or ScriptedModel()
     runtime = Runtime(store, tracer, resolved_clock)
     budget = BudgetKeeper(store, resolved_clock, caps)
     toolbox = Toolbox(world, tracer, resolved_clock, budget)
@@ -60,7 +61,7 @@ def build_app(
         world,
         tracer,
         resolved_clock,
-        model,
+        resolved_model,
         runtime=runtime,
         toolbox=toolbox,
         guard=guard,
@@ -76,7 +77,13 @@ def build_app(
     )
 
 
-def restart_app(app: App, data_dir: str | Path, user_id: str) -> App:
+def restart_app(
+    app: App,
+    data_dir: str | Path,
+    user_id: str,
+    *,
+    model: ScriptedModel | None = None,
+) -> App:
     """Rebuild the kernel over the same database, as a process restart would.
 
     The mock provider world stays alive because it models an external provider;
@@ -95,7 +102,7 @@ def restart_app(app: App, data_dir: str | Path, user_id: str) -> App:
         app.world,
         tracer,
         app.clock,
-        ScriptedModel(),
+        model or ScriptedModel(),
         runtime=runtime,
         toolbox=toolbox,
         guard=guard,

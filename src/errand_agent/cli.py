@@ -163,6 +163,20 @@ def run_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_evals(args: argparse.Namespace) -> int:
+    from errand_agent.evals import run_evals as execute_evals
+
+    report = execute_evals(output_path=args.output)
+    for result in report.results:
+        status = "PASS" if result.passed else "FAIL"
+        print(f"{status} {result.number:02d}. {result.scenario.key}")
+    print(f"\nScenarios: {report.passed_count}/{report.total} passed")
+    invariants = sum(1 for check in report.invariants if check.passed)
+    print(f"Global invariants: {invariants}/{len(report.invariants)} passed")
+    print(f"Report: {Path(args.output).resolve()}")
+    return report.exit_code
+
+
 def print_memory(app: App, user_id: str, *, include_forgotten: bool = False) -> None:
     facts = app.conversation.list_memory(user_id, include_forgotten=include_forgotten)
     if not facts:
@@ -420,6 +434,16 @@ def build_parser() -> argparse.ArgumentParser:
     memory_forget = memory_commands.add_parser("forget", help="forget a preference")
     memory_forget.add_argument("key", choices=[key.value for key in MemoryKey])
     memory_forget.set_defaults(handler=run_memory)
+
+    evals = subparsers.add_parser(
+        "evals", help="run 20 offline scenarios and write EVALS.md"
+    )
+    evals.add_argument(
+        "--output",
+        default="EVALS.md",
+        help="generated Markdown report (default: EVALS.md)",
+    )
+    evals.set_defaults(handler=run_evals)
     return parser
 
 

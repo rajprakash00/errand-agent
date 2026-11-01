@@ -2,13 +2,13 @@
 
 A local, offline errand booking agent with a code-enforced approval kernel.
 
-This repository currently implements tickets 01–09: a scripted CLI errand from
+This repository currently implements tickets 01–10: a scripted CLI errand from
 the first request to a verified booking, approval invalidation and hold expiry,
 timeout reconciliation with restart recovery, cancel/reschedule, untrusted
 review handling with injection defense, bounded execution with clear exits,
-memory with provenance and tombstones, a browser chat with a live trace, and a
-memory panel in the same UI. Everything uses SQLite persistence and a JSONL
-trace.
+memory with provenance and tombstones, a browser chat with a live trace, a
+memory panel in the same UI, and an offline eval harness with 20 scenarios and a
+generated table. Everything uses SQLite persistence and a JSONL trace.
 
 ## Run
 
@@ -21,6 +21,19 @@ uv run pytest
 The demo asks for the missing area, shows six plumbers in Indiranagar, holds the
 earliest slot for the chosen provider, prints the exact approval card, and books
 only after the typed `yes`. It prints the final run state and the trace path.
+
+## Evals
+
+```bash
+uv run errand evals
+```
+
+This runs 20 offline scenarios with a fresh temporary SQLite database, a
+scripted user, the scripted model, a fixed clock, and a deterministic fault plan
+per scenario. The harness asserts outcomes and invariants from the store, the
+mock tool log, and the trace; it does not assert reply wording. It writes the
+generated [`EVALS.md`](EVALS.md) table and exits non-zero if a scenario or a
+global invariant fails.
 
 ## Web UI
 
