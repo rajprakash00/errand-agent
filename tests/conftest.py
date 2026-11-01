@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from errand_agent.budget import BudgetCaps, BudgetKeeper
 from errand_agent.clock import IST, FakeClock
 from errand_agent.conversation import Conversation
 from errand_agent.db import Store
@@ -28,6 +29,47 @@ class TestApp:
     conversation: Conversation
     guard: ExecutionGuard
     clock: FakeClock
+    budget: BudgetKeeper
+    model: ScriptedModel
+
+
+def build_test_app(
+    directory: Path,
+    clock: FakeClock,
+    *,
+    model: ScriptedModel | None = None,
+    caps: BudgetCaps | None = None,
+    world: MockProviderWorld | None = None,
+) -> TestApp:
+    store = Store(directory / "errand.db")
+    tracer = Tracer(directory / "traces", store, clock)
+    resolved_world = world or MockProviderWorld(clock, user_id="user_raj")
+    resolved_model = model or ScriptedModel()
+    runtime = Runtime(store, tracer, clock)
+    budget = BudgetKeeper(store, clock, caps)
+    toolbox = Toolbox(resolved_world, tracer, clock, budget)
+    guard = ExecutionGuard(store, toolbox, runtime, clock)
+    conversation = Conversation(
+        store,
+        resolved_world,
+        tracer,
+        clock,
+        resolved_model,
+        runtime=runtime,
+        toolbox=toolbox,
+        guard=guard,
+        budget=budget,
+    )
+    return TestApp(
+        store=store,
+        world=resolved_world,
+        tracer=tracer,
+        conversation=conversation,
+        guard=guard,
+        clock=clock,
+        budget=budget,
+        model=resolved_model,
+    )
 
 
 @pytest.fixture
@@ -37,32 +79,33 @@ def clock() -> FakeClock:
 
 @pytest.fixture
 def app(tmp_path, clock) -> TestApp:
-    store = Store(tmp_path / "errand.db")
-    tracer = Tracer(tmp_path / "traces", store, clock)
-    world = MockProviderWorld(clock, user_id="user_raj")
-    model = ScriptedModel()
-    runtime = Runtime(store, tracer, clock)
-    toolbox = Toolbox(world, tracer, clock)
-    guard = ExecutionGuard(store, toolbox, runtime, clock)
-    conversation = Conversation(
-        store,
-        world,
-        tracer,
-        clock,
-        model,
-        runtime=runtime,
-        toolbox=toolbox,
-        guard=guard,
-    )
-    yield TestApp(
-        store=store,
-        world=world,
-        tracer=tracer,
-        conversation=conversation,
-        guard=guard,
-        clock=clock,
-    )
-    store.close()
+    instance = build_test_app(tmp_path, clock)
+    yield instance
+    instance.store.close()
+
+
+@pytest.fixture
+def make_app(tmp_path, clock):
+    """Build independent apps with custom caps or a custom model."""
+    created: list[TestApp] = []
+
+    def _make(
+        *,
+        model: ScriptedModel | None = None,
+        caps: BudgetCaps | None = None,
+        name: str | None = None,
+    ) -> TestApp:
+        directory = tmp_path / (name or f"custom-{len(created)}")
+        instance = build_test_app(directory, clock, model=model, caps=caps)
+        created.append(instance)
+        return instance
+
+    yield _make
+    for instance in created:
+        try:
+            instance.store.close()
+        except Exception:
+            pass
 
 
 @pytest.fixture
@@ -75,7 +118,8 @@ def rebuild_app(app: TestApp):
         tracer = Tracer(app.tracer.base_dir, store, app.clock)
         model = ScriptedModel()
         runtime = Runtime(store, tracer, app.clock)
-        toolbox = Toolbox(app.world, tracer, app.clock)
+        budget = BudgetKeeper(store, app.clock, app.budget.caps)
+        toolbox = Toolbox(app.world, tracer, app.clock, budget)
         guard = ExecutionGuard(store, toolbox, runtime, app.clock)
         conversation = Conversation(
             store,
@@ -86,6 +130,7 @@ def rebuild_app(app: TestApp):
             runtime=runtime,
             toolbox=toolbox,
             guard=guard,
+            budget=budget,
         )
         return TestApp(
             store=store,
@@ -94,6 +139,8 @@ def rebuild_app(app: TestApp):
             conversation=conversation,
             guard=guard,
             clock=app.clock,
+            budget=budget,
+            model=model,
         )
 
     return _rebuild
@@ -112,9 +159,7 @@ def seed_booking(app: TestApp):
             "plumber", "Indiranagar", (now, now + timedelta(days=7))
         )
         result = next(item for item in results if item.provider_id == provider_id)
-        return app.world.seed_booking(
-            provider_id, result.free_slots[slot_index], user_id=user_id
-        )
+        return app.world.seed_booking(provider_id, result.free_slots[slot_index], user_id=user_id)
 
     return _seed
 

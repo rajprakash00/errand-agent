@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from errand_agent.budget import BudgetCaps, BudgetKeeper
 from errand_agent.clock import IST, Clock, FakeClock, SystemClock
 from errand_agent.conversation import Conversation
 from errand_agent.db import Store
@@ -28,6 +29,7 @@ class App:
     tracer: Tracer
     conversation: Conversation
     clock: Clock
+    budget: BudgetKeeper
 
     def close(self) -> None:
         self.store.close()
@@ -38,6 +40,7 @@ def build_app(
     *,
     clock: Clock | None = None,
     user_id: str = "user_raj",
+    caps: BudgetCaps | None = None,
 ) -> App:
     resolved_clock = clock or SystemClock()
     path = Path(data_dir)
@@ -46,7 +49,8 @@ def build_app(
     world = MockProviderWorld(resolved_clock, user_id=user_id)
     model = ScriptedModel()
     runtime = Runtime(store, tracer, resolved_clock)
-    toolbox = Toolbox(world, tracer, resolved_clock)
+    budget = BudgetKeeper(store, resolved_clock, caps)
+    toolbox = Toolbox(world, tracer, resolved_clock, budget)
     guard = ExecutionGuard(store, toolbox, runtime, resolved_clock)
     conversation = Conversation(
         store,
@@ -57,6 +61,7 @@ def build_app(
         runtime=runtime,
         toolbox=toolbox,
         guard=guard,
+        budget=budget,
     )
     return App(
         store=store,
@@ -64,6 +69,7 @@ def build_app(
         tracer=tracer,
         conversation=conversation,
         clock=resolved_clock,
+        budget=budget,
     )
 
 
@@ -88,7 +94,8 @@ def restart_app(app: App, data_dir: str | Path, user_id: str) -> App:
     store = Store(path / "errand.db")
     tracer = Tracer(path / "traces", store, app.clock)
     runtime = Runtime(store, tracer, app.clock)
-    toolbox = Toolbox(app.world, tracer, app.clock)
+    budget = BudgetKeeper(store, app.clock, app.budget.caps)
+    toolbox = Toolbox(app.world, tracer, app.clock, budget)
     guard = ExecutionGuard(store, toolbox, runtime, app.clock)
     conversation = Conversation(
         store,
@@ -99,6 +106,7 @@ def restart_app(app: App, data_dir: str | Path, user_id: str) -> App:
         runtime=runtime,
         toolbox=toolbox,
         guard=guard,
+        budget=budget,
     )
     return App(
         store=store,
@@ -106,15 +114,14 @@ def restart_app(app: App, data_dir: str | Path, user_id: str) -> App:
         tracer=tracer,
         conversation=conversation,
         clock=app.clock,
+        budget=budget,
     )
 
 
 def seed_demo_booking(app: App, user_id: str) -> None:
     """Seed one future booking for the cancel and reschedule demos."""
     now = app.clock.now()
-    results = app.world.search_providers(
-        "plumber", "Indiranagar", (now, now + timedelta(days=7))
-    )
+    results = app.world.search_providers("plumber", "Indiranagar", (now, now + timedelta(days=7)))
     if not results:
         raise RuntimeError("no provider slots are available to seed a booking")
     # Prefer a provider with spare slots so the reschedule-conflict demo has a
@@ -194,7 +201,8 @@ FAULT_SCENARIOS = frozenset(
 def run_demo(args: argparse.Namespace) -> int:
     needs_clock = args.scenario in {"hold-expiry"}
     demo_clock = FakeClock(datetime.now(IST)) if needs_clock else None
-    app = build_app(args.data_dir, user_id=args.user_id, clock=demo_clock)
+    caps = BudgetCaps(turn_cap=1) if args.scenario == "limit-turns" else None
+    app = build_app(args.data_dir, user_id=args.user_id, clock=demo_clock, caps=caps)
     try:
         print("Errand Agent — scripted demo")
         print(f"Scenario: {args.scenario}")
@@ -202,6 +210,8 @@ def run_demo(args: argparse.Namespace) -> int:
 
         if args.scenario in {"cancel", "reschedule-conflict"}:
             seed_demo_booking(app, args.user_id)
+        if args.scenario == "unknown-error":
+            app.world.fail_next_search()
 
         if args.scenario == "cancel":
             first = "Cancel my booking."
@@ -218,6 +228,7 @@ def run_demo(args: argparse.Namespace) -> int:
             RequiredSlot.TIME_WINDOW: "this week",
         }
         injected = args.scenario not in FAULT_SCENARIOS
+        review_shown = False
         for _ in range(12):
             if turn.terminal:
                 break
@@ -229,7 +240,11 @@ def run_demo(args: argparse.Namespace) -> int:
                     injected = True
                 reply = "yes"
             elif turn.options:
-                reply = "2" if len(turn.options) >= 2 else "1"
+                if args.scenario == "injection" and not review_shown:
+                    reply = "reviews for 2"
+                    review_shown = True
+                else:
+                    reply = "2" if len(turn.options) >= 2 else "1"
             else:
                 break
             try:
@@ -254,7 +269,12 @@ def run_demo(args: argparse.Namespace) -> int:
         print(f"\nBookings recorded: {len(active)}")
         print(f"Final state: {turn.state.value}")
         print(f"Trace: {turn.trace_path}")
-        return 0 if turn.state in (RunState.COMPLETED, RunState.CANCELLED) else 1
+        expected = {RunState.COMPLETED, RunState.CANCELLED}
+        if args.scenario == "limit-turns":
+            expected.add(RunState.LIMIT_REACHED)
+        if args.scenario == "unknown-error":
+            expected.add(RunState.FAILED)
+        return 0 if turn.state in expected else 1
     finally:
         app.close()
 
@@ -310,6 +330,9 @@ def build_parser() -> argparse.ArgumentParser:
             "restart-mid-booking",
             "cancel",
             "reschedule-conflict",
+            "injection",
+            "limit-turns",
+            "unknown-error",
         ),
         default="happy",
         help="fault to inject after the first approval card",

@@ -2,10 +2,11 @@
 
 A local, offline errand booking agent with a code-enforced approval kernel.
 
-This repository currently implements tickets 01–04: a scripted CLI errand from
+This repository currently implements tickets 01–06: a scripted CLI errand from
 the first request to a verified booking, approval invalidation and hold expiry,
-timeout reconciliation with restart recovery, and cancel/reschedule, with SQLite
-persistence and a JSONL trace.
+timeout reconciliation with restart recovery, cancel/reschedule, untrusted
+review handling with injection defense, and bounded execution with clear exits,
+with SQLite persistence and a JSONL trace.
 
 ## Run
 
@@ -57,8 +58,30 @@ transient 503; the agent retries with the same key and verifies the booking is
 gone. The reschedule demo seeds a booking, rejects the first approved slot, and
 shows a second slot with a new approval before the booking moves.
 
+Review injection and bounded-execution scenarios:
+
+```bash
+uv run errand demo --scenario injection
+uv run errand demo --scenario limit-turns
+uv run errand demo --scenario unknown-error
+```
+
+Reviews are displayed as untrusted quotes. A review that says "ignore previous
+instructions" is shown with the `untrusted` label but cannot change the proposal,
+hold a slot, book, or write an approval. The model's tool surface exposes only
+read tools; `hold_slot`, `book`, `cancel`, `reschedule`, and the approval write
+path fail closed. The `injection` demo shows the seeded hostile review, then
+books only the quoted provider after the typed approval.
+
+Every run has hard caps: 12 model turns, 30 tool calls, 15 minutes wall clock,
+and 90 seconds per turn. The counters are persisted in SQLite. `limit-turns`
+forces the turn cap and ends at `limit_reached` with the trace ID and a
+statement that no booking was made. `unknown-error` forces an unexpected search
+failure and ends at `failed` with a clear message and no stack trace.
+
 Use `uv run errand chat` for an interactive session. The chat startup resolves
-any intents a previous process left in flight.
+any intents a previous process left in flight. In the options step, ask for
+`reviews for 2` (Ravi Plumbing Works) to see the seeded injected review.
 
 ## What is enforced
 
@@ -90,6 +113,14 @@ any intents a previous process left in flight.
 - A reschedule conflict voids the consumed approval, keeps the booking
   unchanged, and produces a new hold, slot, price, and approval. The booking
   moves only after the second approval.
+- Provider reviews are sanitised, bounded, labelled untrusted, and rendered as
+  quotes. The review text is not part of the proposal or approval path. The
+  model's tool surface is read-only, so a model that follows an injection still
+  cannot hold, book, cancel, reschedule, or write an approval.
+- Turn, tool, wall-clock, and per-turn caps are checked before each step and
+  persisted per run. Exhaustion ends at `limit_reached` with the trace ID and a
+  no-booking statement. Unexpected errors end at `failed` with a clear message
+  and no stack trace. Both write a final `run_finished` trace event.
 - Every run writes a JSONL trace plus an indexed copy of the events in SQLite.
   Timeout runs show `book` error → `get_booking_status` → `reconciliation` →
   `run_finished`.

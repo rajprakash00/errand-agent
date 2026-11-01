@@ -516,6 +516,7 @@ class MockProviderWorld:
         self._bookings: list[WorldBooking] = []
         self._timeout_plan: list[bool] = []
         self._crash_plan: list[bool] = []
+        self._search_failures: list[Exception] = []
         self._cancel_keys: dict[str, str] = {}
         self._reschedule_keys: dict[str, str] = {}
         self._cancel_transient_seen: set[str] = set()
@@ -564,6 +565,10 @@ class MockProviderWorld:
     def fail_next_cancel(self, times: int = 1) -> None:
         """Force transient cancel failures before the built-in first-call 503."""
         self._forced_cancel_failures += times
+
+    def fail_next_search(self, message: str = "the provider search service crashed") -> None:
+        """Make the next search raise an unexpected error (demo fault control)."""
+        self._search_failures.append(RuntimeError(message))
 
     def configure_reschedule_conflict(self, provider_id: str, slot_start: datetime) -> None:
         self._reschedule_conflicts.add((provider_id, slot_start))
@@ -683,6 +688,8 @@ class MockProviderWorld:
     ) -> list[SearchResult]:
         args = {"service": service, "area": area, "date_range": date_range}
         try:
+            if self._search_failures:
+                raise self._search_failures.pop(0)
             service_key = service.strip().lower()
             area_key = area.strip().lower()
             results: list[SearchResult] = []

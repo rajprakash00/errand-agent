@@ -61,3 +61,24 @@ replacement slot remains after the conflict.
 **Regression:** `tests/test_cli.py::test_demo_reschedule_conflict_reapproves_and_reschedules`
 asserts two approval cards, one `slot_conflict` reconciliation, and exactly one
 successful reschedule.
+
+## 4. The per-turn cap counted idle time between user messages
+
+**Found:** while running the existing hold-expiry test during ticket 06.
+
+**Symptom:** The hold-expiry test advanced the fake clock by 11 minutes to expire
+the hold, then sent a new message. The run ended at `limit_reached` with
+`turn_timeout` instead of re-holding and asking for a new approval. Any user who
+paused for more than 90 seconds between messages would have lost the run.
+
+**Cause:** `BudgetKeeper.begin_turn` checked the elapsed time since the previous
+turn started, before resetting the turn clock. A gap between user messages is
+idle time, not a slow model turn.
+
+**Fix:** `begin_turn` now only checks the run's wall-clock deadline, then resets
+`turn_started_at`. The 90-second per-turn cap is checked during the turn by
+`spend_model_turn` and `spend_tool`.
+
+**Regression:** `tests/test_budgets.py::test_a_gap_between_user_turns_does_not_trip_the_turn_timeout`
+advances the clock five minutes between messages and asserts the run continues
+to `options_ready`.

@@ -22,6 +22,7 @@ from errand_agent.models import (
     Proposal,
     ProposalState,
     ProviderOption,
+    RunBudget,
     RunRecord,
     RunState,
 )
@@ -129,6 +130,14 @@ CREATE TABLE IF NOT EXISTS trace_events (
     payload_json TEXT NOT NULL,
     latency_ms INTEGER,
     UNIQUE (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_budgets (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    turns INTEGER NOT NULL DEFAULT 0,
+    tool_calls INTEGER NOT NULL DEFAULT 0,
+    turn_started_at TEXT NOT NULL,
+    deadline_at TEXT NOT NULL
 );
 """
 
@@ -292,6 +301,41 @@ class Store:
         self.conn.execute(
             "UPDATE runs SET options_json = ?, updated_at = ? WHERE id = ?",
             (payload, _iso(now), run_id),
+        )
+
+    # -- budgets ------------------------------------------------------------
+
+    def create_budget(self, run_id: str, now: datetime, deadline_at: datetime) -> None:
+        self.conn.execute(
+            "INSERT INTO run_budgets (run_id, turns, tool_calls, turn_started_at, deadline_at) "
+            "VALUES (?, 0, 0, ?, ?)",
+            (run_id, _iso(now), _iso(deadline_at)),
+        )
+
+    def get_budget(self, run_id: str) -> RunBudget | None:
+        row = self.conn.execute("SELECT * FROM run_budgets WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        return RunBudget(
+            run_id=row["run_id"],
+            turns=row["turns"],
+            tool_calls=row["tool_calls"],
+            turn_started_at=_dt(row["turn_started_at"]),
+            deadline_at=_dt(row["deadline_at"]),
+        )
+
+    def begin_budget_turn(self, run_id: str, now: datetime) -> None:
+        self.conn.execute(
+            "UPDATE run_budgets SET turn_started_at = ? WHERE run_id = ?",
+            (_iso(now), run_id),
+        )
+
+    def increment_budget_turns(self, run_id: str) -> None:
+        self.conn.execute("UPDATE run_budgets SET turns = turns + 1 WHERE run_id = ?", (run_id,))
+
+    def increment_budget_tool_calls(self, run_id: str) -> None:
+        self.conn.execute(
+            "UPDATE run_budgets SET tool_calls = tool_calls + 1 WHERE run_id = ?", (run_id,)
         )
 
     # -- messages -----------------------------------------------------------

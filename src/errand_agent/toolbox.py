@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from errand_agent.budget import BudgetKeeper
 from errand_agent.clock import Clock
 from errand_agent.trace import Tracer
 from errand_agent.world import MockProviderWorld
@@ -23,10 +24,17 @@ ALLOWED_TOOLS = frozenset(
 
 
 class Toolbox:
-    def __init__(self, world: MockProviderWorld, tracer: Tracer, clock: Clock) -> None:
+    def __init__(
+        self,
+        world: MockProviderWorld,
+        tracer: Tracer,
+        clock: Clock,
+        budget: BudgetKeeper | None = None,
+    ) -> None:
         self.world = world
         self.tracer = tracer
         self.clock = clock
+        self.budget = budget
 
     def _latency_ms(self, start: Any) -> int:
         delta = self.clock.now() - start
@@ -35,6 +43,8 @@ class Toolbox:
     def call(self, run_id: str, name: str, *, attempt: int = 1, **kwargs: Any) -> Any:
         if name not in ALLOWED_TOOLS:
             raise ValueError(f"tool is not exposed to the kernel: {name}")
+        if self.budget is not None:
+            self.budget.spend_tool(run_id, name)
         start = self.clock.now()
         try:
             result = getattr(self.world, name)(**kwargs)
