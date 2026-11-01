@@ -69,7 +69,7 @@ def _seed() -> tuple[ProviderSeed, ...]:
             649,
             4.6,
             ("insured", "10-year warranty"),
-            ((1, 11, 0), (3, 16, 0)),
+            ((1, 11, 0), (2, 8, 0), (3, 16, 0)),
             (
                 DEFAULT_REVIEWS[0],
                 Review(
@@ -548,6 +548,10 @@ class MockProviderWorld:
     @property
     def services(self) -> tuple[str, ...]:
         return tuple(sorted({provider.service for provider in self._providers.values()}))
+
+    @property
+    def provider_names(self) -> dict[str, str]:
+        return {provider.id: provider.name for provider in self._providers.values()}
 
     def calls_named(self, name: str) -> list[WorldCall]:
         return [call for call in self.calls if call.name == name]

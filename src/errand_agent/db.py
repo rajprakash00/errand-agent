@@ -15,9 +15,13 @@ from errand_agent.models import (
     ApprovalState,
     BookingRecord,
     ErrandSlots,
+    FactProvenance,
+    FactStatus,
     HoldRecord,
     IntentRecord,
     IntentState,
+    MemoryFact,
+    MemoryKey,
     MessageRecord,
     Proposal,
     ProposalState,
@@ -139,6 +143,25 @@ CREATE TABLE IF NOT EXISTS run_budgets (
     turn_started_at TEXT NOT NULL,
     deadline_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS facts (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT,
+    provenance TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source_turn_id TEXT,
+    confirmed_by TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    forgotten_at TEXT,
+    tombstone_hash TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_facts_user_key ON facts(user_id, key, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_one_current
+    ON facts(user_id, key) WHERE status IN ('active', 'pending_confirmation');
 """
 
 
@@ -741,6 +764,142 @@ class Store:
             status=row["status"],
             idempotency_key=row["idempotency_key"],
             created_at=_dt(row["created_at"]),
+        )
+
+    # -- memory facts -------------------------------------------------------
+
+    def create_fact(self, fact: MemoryFact) -> MemoryFact:
+        self.conn.execute(
+            "INSERT INTO facts (id, user_id, key, value, provenance, status, source_turn_id, "
+            "confirmed_by, created_at, updated_at, forgotten_at, tombstone_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fact.id,
+                fact.user_id,
+                fact.key.value,
+                fact.value,
+                fact.provenance.value,
+                fact.status.value,
+                fact.source_turn_id,
+                fact.confirmed_by,
+                _iso(fact.created_at),
+                _iso(fact.updated_at),
+                _iso(fact.forgotten_at) if fact.forgotten_at else None,
+                fact.tombstone_hash,
+            ),
+        )
+        return fact
+
+    def get_fact(self, fact_id: str) -> MemoryFact | None:
+        row = self.conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
+        if row is None:
+            return None
+        return self._fact_from_row(row)
+
+    def list_facts(
+        self, user_id: str, statuses: tuple[FactStatus, ...]
+    ) -> list[MemoryFact]:
+        placeholders = ", ".join("?" for _ in statuses)
+        rows = self.conn.execute(
+            f"SELECT * FROM facts WHERE user_id = ? AND status IN ({placeholders}) "
+            "ORDER BY key, created_at, rowid",
+            (user_id, *(status.value for status in statuses)),
+        ).fetchall()
+        return [self._fact_from_row(row) for row in rows]
+
+    def list_fact_history(self, user_id: str, key: MemoryKey) -> list[MemoryFact]:
+        rows = self.conn.execute(
+            "SELECT * FROM facts WHERE user_id = ? AND key = ? ORDER BY created_at, rowid",
+            (user_id, key.value),
+        ).fetchall()
+        return [self._fact_from_row(row) for row in rows]
+
+    def get_current_fact(self, user_id: str, key: MemoryKey) -> MemoryFact | None:
+        row = self.conn.execute(
+            "SELECT * FROM facts WHERE user_id = ? AND key = ? "
+            "AND status IN (?, ?) ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            (user_id, key.value, FactStatus.ACTIVE.value, FactStatus.PENDING_CONFIRMATION.value),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._fact_from_row(row)
+
+    def get_active_fact(self, user_id: str, key: MemoryKey) -> MemoryFact | None:
+        row = self.conn.execute(
+            "SELECT * FROM facts WHERE user_id = ? AND key = ? AND status = ? "
+            "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            (user_id, key.value, FactStatus.ACTIVE.value),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._fact_from_row(row)
+
+    def get_pending_fact(self, user_id: str, key: MemoryKey) -> MemoryFact | None:
+        row = self.conn.execute(
+            "SELECT * FROM facts WHERE user_id = ? AND key = ? AND status = ? "
+            "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            (user_id, key.value, FactStatus.PENDING_CONFIRMATION.value),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._fact_from_row(row)
+
+    def get_latest_tombstone(self, user_id: str, key: MemoryKey) -> MemoryFact | None:
+        row = self.conn.execute(
+            "SELECT * FROM facts WHERE user_id = ? AND key = ? AND status = ? "
+            "ORDER BY forgotten_at DESC, rowid DESC LIMIT 1",
+            (user_id, key.value, FactStatus.FORGOTTEN.value),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._fact_from_row(row)
+
+    def fact_source_seen(self, user_id: str, key: MemoryKey, source_turn_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM facts WHERE user_id = ? AND key = ? AND source_turn_id = ? LIMIT 1",
+            (user_id, key.value, source_turn_id),
+        ).fetchone()
+        return row is not None
+
+    def archive_fact(self, fact_id: str, now: datetime) -> None:
+        self.conn.execute(
+            "UPDATE facts SET status = ?, updated_at = ? WHERE id = ?",
+            (FactStatus.ARCHIVED.value, _iso(now), fact_id),
+        )
+
+    def confirm_fact(self, fact_id: str, confirmed_by: str, now: datetime) -> None:
+        self.conn.execute(
+            "UPDATE facts SET status = ?, confirmed_by = ?, updated_at = ? WHERE id = ?",
+            (FactStatus.ACTIVE.value, confirmed_by, _iso(now), fact_id),
+        )
+
+    def forget_fact(self, fact_id: str, now: datetime, tombstone_hash: str) -> None:
+        self.conn.execute(
+            "UPDATE facts SET value = NULL, status = ?, forgotten_at = ?, "
+            "tombstone_hash = ?, updated_at = ? WHERE id = ?",
+            (
+                FactStatus.FORGOTTEN.value,
+                _iso(now),
+                tombstone_hash,
+                _iso(now),
+                fact_id,
+            ),
+        )
+
+    def _fact_from_row(self, row: sqlite3.Row) -> MemoryFact:
+        return MemoryFact(
+            id=row["id"],
+            user_id=row["user_id"],
+            key=MemoryKey(row["key"]),
+            value=row["value"],
+            provenance=FactProvenance(row["provenance"]),
+            status=FactStatus(row["status"]),
+            source_turn_id=row["source_turn_id"],
+            confirmed_by=row["confirmed_by"],
+            created_at=_dt(row["created_at"]),
+            updated_at=_dt(row["updated_at"]),
+            forgotten_at=_dt(row["forgotten_at"]) if row["forgotten_at"] else None,
+            tombstone_hash=row["tombstone_hash"],
         )
 
     # -- trace index --------------------------------------------------------

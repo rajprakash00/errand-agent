@@ -16,7 +16,7 @@ from errand_agent.approval import (
     record_approval,
 )
 from errand_agent.budget import BudgetExceeded, BudgetKeeper
-from errand_agent.clock import Clock
+from errand_agent.clock import IST, Clock
 from errand_agent.db import Store
 from errand_agent.dialogue import (
     is_review_request,
@@ -37,7 +37,19 @@ from errand_agent.guard import (
     VerificationFailed,
 )
 from errand_agent.ids import new_id
-from errand_agent.model import DraftRequest, ExtractionContext, ScriptedModel
+from errand_agent.memory import (
+    Memory,
+    canonical_value,
+    clock_time,
+    parse_stated_facts,
+    parse_time_preference,
+)
+from errand_agent.model import (
+    DraftRequest,
+    ExtractionContext,
+    MemoryInferenceContext,
+    ScriptedModel,
+)
 from errand_agent.model_tools import ModelToolbox
 from errand_agent.models import (
     Action,
@@ -46,6 +58,8 @@ from errand_agent.models import (
     BookingRecord,
     ErrandSlots,
     HoldRecord,
+    MemoryFact,
+    MemoryKey,
     Proposal,
     ProposalState,
     ProviderOption,
@@ -87,6 +101,7 @@ class Conversation:
         toolbox: Toolbox | None = None,
         guard: ExecutionGuard | None = None,
         budget: BudgetKeeper | None = None,
+        memory: Memory | None = None,
     ) -> None:
         self.store = store
         self.world = world
@@ -97,6 +112,7 @@ class Conversation:
         self.budget = budget or BudgetKeeper(store, clock)
         self.toolbox = toolbox or Toolbox(world, tracer, clock, self.budget)
         self.guard = guard or ExecutionGuard(store, self.toolbox, self.runtime, clock)
+        self.memory = memory or Memory(store, clock)
         if hasattr(self.model, "bind_tools"):
             self.model.bind_tools(lambda run_id: ModelToolbox(self.toolbox, run_id))
 
@@ -117,7 +133,10 @@ class Conversation:
         try:
             self.budget.begin_turn(run_id)
             self.budget.spend_model_turn(run_id)
-            self.runtime.user_message(run_id, text)
+            message = self.runtime.user_message(run_id, text)
+            facts = self._ingest_memory(
+                run_id, user_id, text, message.id, message.created_at
+            )
             self.runtime.trace(
                 run_id,
                 "model_call",
@@ -135,10 +154,12 @@ class Conversation:
             )
             self.runtime.transition(run_id, RunState.COLLECTING, reason="intake")
             if action == Action.CANCEL:
-                return self._collect_cancel(run_id, text)
-            if action == Action.RESCHEDULE:
-                return self._collect_reschedule(run_id, text)
-            return self._collect(run_id, text)
+                turn = self._collect_cancel(run_id, text)
+            elif action == Action.RESCHEDULE:
+                turn = self._collect_reschedule(run_id, text)
+            else:
+                turn = self._collect(run_id, text)
+            return self._with_memory(turn, facts)
         except BudgetExceeded as exc:
             return self._limit_reached(run_id, exc.reason)
         except ProcessCrash:
@@ -183,28 +204,35 @@ class Conversation:
 
     def _send_message(self, run_id: str, text: str) -> TurnResult:
         run = self.store.require_run(run_id)
-        self.runtime.user_message(run_id, text)
+        message = self.runtime.user_message(run_id, text)
+        facts = self._ingest_memory(
+            run_id, run.user_id, text, message.id, message.created_at
+        )
         if run.state == RunState.COLLECTING:
             if run.action == Action.CANCEL:
-                return self._collect_cancel(run_id, text)
-            if run.action == Action.RESCHEDULE:
-                return self._collect_reschedule(run_id, text)
-            return self._collect(run_id, text)
-        if run.state == RunState.OPTIONS_READY:
+                turn = self._collect_cancel(run_id, text)
+            elif run.action == Action.RESCHEDULE:
+                turn = self._collect_reschedule(run_id, text)
+            else:
+                turn = self._collect(run_id, text)
+        elif run.state == RunState.OPTIONS_READY:
             if run.action == Action.CANCEL:
-                return self._collect_cancel(run_id, text)
-            if run.action == Action.RESCHEDULE:
-                return self._collect_reschedule(run_id, text)
-            if is_review_request(text):
-                return self._handle_reviews(run_id, text)
-            return self._select_option(run_id, text)
-        if run.state == RunState.AWAITING_APPROVAL:
-            return self._handle_confirmation(run_id, text)
-        if run.state == RunState.NEEDS_HUMAN:
-            message = "This errand is parked. Start a new errand when you are ready."
-            self.runtime.assistant_message(run_id, message)
-            return self._turn(run_id, [message])
-        raise ConversationError(f"cannot handle a message in state {run.state.value}")
+                turn = self._collect_cancel(run_id, text)
+            elif run.action == Action.RESCHEDULE:
+                turn = self._collect_reschedule(run_id, text)
+            elif is_review_request(text):
+                turn = self._handle_reviews(run_id, text)
+            else:
+                turn = self._select_option(run_id, text)
+        elif run.state == RunState.AWAITING_APPROVAL:
+            turn = self._handle_confirmation(run_id, text)
+        elif run.state == RunState.NEEDS_HUMAN:
+            parked = "This errand is parked. Start a new errand when you are ready."
+            self.runtime.assistant_message(run_id, parked)
+            turn = self._turn(run_id, [parked])
+        else:
+            raise ConversationError(f"cannot handle a message in state {run.state.value}")
+        return self._with_memory(turn, facts)
 
     def recover_pending(self) -> list[TurnResult]:
         """Finish intents that a previous process left in flight."""
@@ -258,6 +286,76 @@ class Conversation:
             turns.append(self._turn(run.id, [message], booking=outcome.booking))
         return turns
 
+    # -- memory -------------------------------------------------------------
+
+    def list_memory(
+        self, user_id: str, *, include_forgotten: bool = False
+    ) -> list[MemoryFact]:
+        return self.memory.list_facts(user_id, include_forgotten=include_forgotten)
+
+    def remember_memory(
+        self, user_id: str, key: MemoryKey | str, value: str, *, run_id: str | None = None
+    ) -> MemoryFact | None:
+        resolved = self._memory_key(key)
+        fact = self.memory.record_stated(
+            user_id, resolved, self._canonical_fact_value(resolved, value)
+        )
+        if run_id is not None:
+            self._trace_memory_write(run_id, "stated", resolved, fact)
+        return fact
+
+    def correct_memory(
+        self, user_id: str, key: MemoryKey | str, value: str, *, run_id: str | None = None
+    ) -> MemoryFact | None:
+        resolved = self._memory_key(key)
+        fact = self.memory.record_stated(
+            user_id, resolved, self._canonical_fact_value(resolved, value)
+        )
+        if run_id is not None:
+            self._trace_memory_write(
+                run_id, "stated", resolved, fact, action="correct"
+            )
+        return fact
+
+    def confirm_memory(
+        self, user_id: str, key: MemoryKey | str, *, run_id: str | None = None
+    ) -> MemoryFact | None:
+        resolved = self._memory_key(key)
+        fact = self.memory.confirm(user_id, resolved)
+        if run_id is not None and fact is not None:
+            self.runtime.trace(
+                run_id,
+                "memory_write",
+                {
+                    "key": resolved.value,
+                    "value": fact.value,
+                    "provenance": fact.provenance.value,
+                    "status": fact.status.value,
+                    "action": "confirm",
+                    "confirmed_by": fact.confirmed_by,
+                },
+            )
+        return fact
+
+    def forget_memory(
+        self, user_id: str, key: MemoryKey | str, *, run_id: str | None = None
+    ) -> MemoryFact | None:
+        resolved = self._memory_key(key)
+        fact = self.memory.forget(user_id, resolved)
+        if run_id is not None and fact is not None:
+            self.runtime.trace(
+                run_id,
+                "memory_write",
+                {
+                    "key": resolved.value,
+                    "provenance": fact.provenance.value,
+                    "status": fact.status.value,
+                    "action": "forget",
+                    "tombstone_hash": fact.tombstone_hash,
+                },
+            )
+        return fact
+
     # -- collecting ---------------------------------------------------------
 
     def _collect(self, run_id: str, text: str) -> TurnResult:
@@ -266,6 +364,7 @@ class Conversation:
         pending = missing[0] if missing else None
         extracted = self._extract(run_id, text, pending, run.slots)
         merged = merge_slots(run.slots, extracted)
+        merged = self._apply_area_memory(run_id, run.user_id, merged)
         self.store.update_run_slots(run_id, merged, self.clock.now())
 
         still_missing = merged.missing()
@@ -333,6 +432,7 @@ class Conversation:
             )
             for result in results
         ]
+        options = self._apply_option_memory(run_id, self.store.require_run(run_id).user_id, options)
         self.store.update_run_options(run_id, options, self.clock.now())
 
         if not options:
@@ -560,6 +660,7 @@ class Conversation:
             )
             for result in results
         ]
+        options = self._apply_option_memory(run_id, self.store.require_run(run_id).user_id, options)
         self.store.update_run_options(run_id, options, self.clock.now())
         return options
 
@@ -1193,6 +1294,288 @@ class Conversation:
             if normalized in {booking.id.lower(), booking.provider_id.lower()}:
                 return position
         return None
+
+    # -- memory helpers -----------------------------------------------------
+
+    @staticmethod
+    def _memory_key(key: MemoryKey | str) -> MemoryKey:
+        return key if isinstance(key, MemoryKey) else MemoryKey(key)
+
+    def _provider_directory(self) -> dict[str, str]:
+        directory: dict[str, str] = {}
+        for provider_id, name in self.world.provider_names.items():
+            directory[provider_id.lower()] = provider_id
+            directory[name.lower()] = provider_id
+        return directory
+
+    def _canonical_area(self, value: str) -> str:
+        lowered = value.strip().lower()
+        for area in self.world.areas:
+            if area.lower() == lowered:
+                return area
+        for area in self.world.areas:
+            if area.lower() in lowered:
+                return area
+        known = ", ".join(self.world.areas)
+        raise ValueError(f"unknown area: {value}. Known areas: {known}")
+
+    def _canonical_provider(self, value: str) -> str:
+        lowered = value.strip().lower()
+        directory = self._provider_directory()
+        provider_id = directory.get(lowered)
+        if provider_id is None:
+            for name, candidate in directory.items():
+                if name and (name in lowered or (len(lowered) >= 4 and lowered in name)):
+                    provider_id = candidate
+                    break
+        if provider_id is None:
+            raise ValueError(f"unknown provider: {value}")
+        return provider_id
+
+    def _canonical_fact_value(self, key: MemoryKey, value: str) -> str:
+        if key == MemoryKey.AREA:
+            return self._canonical_area(value)
+        if key == MemoryKey.PREFERRED_PROVIDER_ID:
+            return self._canonical_provider(value)
+        if key == MemoryKey.EARLIEST_TIME:
+            parsed = parse_time_preference(value)
+            if parsed is None:
+                raise ValueError(f"not a time preference: {value}")
+            return parsed
+        return canonical_value(key, value)
+
+    def _ingest_memory(
+        self,
+        run_id: str,
+        user_id: str,
+        text: str,
+        source_turn_id: str,
+        occurred_at: datetime,
+    ) -> list[MemoryFact]:
+        facts: list[MemoryFact] = []
+        stated = parse_stated_facts(
+            text,
+            known_areas=self.world.areas,
+            known_providers=self._provider_directory(),
+        )
+        for parsed in stated:
+            fact = self.memory.record_stated(
+                user_id,
+                parsed.key,
+                parsed.value,
+                source_turn_id=source_turn_id,
+                occurred_at=occurred_at,
+            )
+            self._trace_memory_write(
+                run_id,
+                "stated",
+                parsed.key,
+                fact,
+                source_turn_id=source_turn_id,
+            )
+            if fact is not None:
+                facts.append(fact)
+
+        stated_keys = {parsed.key for parsed in stated}
+        inferred = self.model.infer_facts(
+            text,
+            MemoryInferenceContext(
+                known_areas=self.world.areas,
+                known_providers=self._provider_directory(),
+            ),
+        )
+        for item in inferred:
+            if item.key in stated_keys:
+                continue
+            fact = self.memory.record_inferred(
+                user_id,
+                item.key,
+                item.value,
+                source_turn_id=source_turn_id,
+                occurred_at=occurred_at,
+            )
+            self._trace_memory_write(
+                run_id,
+                "inferred",
+                item.key,
+                fact,
+                source_turn_id=source_turn_id,
+                reason=item.reason,
+            )
+            if fact is not None:
+                facts.append(fact)
+        return facts
+
+    def _trace_memory_write(
+        self,
+        run_id: str,
+        provenance: str,
+        key: MemoryKey,
+        fact: MemoryFact | None,
+        *,
+        source_turn_id: str | None = None,
+        reason: str | None = None,
+        action: str = "remember",
+    ) -> None:
+        payload: dict[str, object] = {
+            "key": key.value,
+            "provenance": provenance,
+            "action": action,
+        }
+        if source_turn_id is not None:
+            payload["source_turn_id"] = source_turn_id
+        if fact is None:
+            payload["skipped"] = True
+            payload["reason"] = "duplicate_or_tombstone"
+        else:
+            payload["fact_id"] = fact.id
+            payload["value"] = fact.value
+            payload["status"] = fact.status.value
+        if reason is not None:
+            payload["inference_reason"] = reason
+        self.runtime.trace(run_id, "memory_write", payload)
+
+    def _apply_area_memory(
+        self, run_id: str, user_id: str, slots: ErrandSlots
+    ) -> ErrandSlots:
+        if slots.area is not None:
+            active = self.memory.active_fact(user_id, MemoryKey.AREA)
+            if active is not None and active.value != slots.area:
+                self.runtime.trace(
+                    run_id,
+                    "memory_read",
+                    {
+                        "key": MemoryKey.AREA.value,
+                        "value": active.value,
+                        "status": active.status.value,
+                        "provenance": active.provenance.value,
+                        "used": False,
+                        "reason": "user_stated_area",
+                    },
+                )
+            return slots
+        active = self.memory.active_fact(user_id, MemoryKey.AREA)
+        if active is not None and active.value is not None:
+            self.runtime.trace(
+                run_id,
+                "memory_read",
+                {
+                    "key": MemoryKey.AREA.value,
+                    "value": active.value,
+                    "status": active.status.value,
+                    "provenance": active.provenance.value,
+                    "used": True,
+                },
+            )
+            return slots.model_copy(update={"area": active.value})
+        pending = self.memory.pending_fact(user_id, MemoryKey.AREA)
+        if pending is not None:
+            self.runtime.trace(
+                run_id,
+                "memory_read",
+                {
+                    "key": MemoryKey.AREA.value,
+                    "value": pending.value,
+                    "status": pending.status.value,
+                    "provenance": pending.provenance.value,
+                    "used": False,
+                    "reason": "pending_confirmation",
+                },
+            )
+        return slots
+
+    def _apply_option_memory(
+        self, run_id: str, user_id: str, options: list[ProviderOption]
+    ) -> list[ProviderOption]:
+        earliest = self.memory.active_fact(user_id, MemoryKey.EARLIEST_TIME)
+        pending_earliest = self.memory.pending_fact(user_id, MemoryKey.EARLIEST_TIME)
+        if earliest is not None:
+            cutoff = clock_time(earliest.value or "")
+            if cutoff is not None:
+                filtered: list[ProviderOption] = []
+                removed = 0
+                for option in options:
+                    slots = [
+                        slot
+                        for slot in option.free_slots
+                        if slot.astimezone(IST).time() >= cutoff
+                    ]
+                    removed += len(option.free_slots) - len(slots)
+                    if slots:
+                        filtered.append(option.model_copy(update={"free_slots": slots}))
+                self.runtime.trace(
+                    run_id,
+                    "memory_read",
+                    {
+                        "key": MemoryKey.EARLIEST_TIME.value,
+                        "value": earliest.value,
+                        "status": earliest.status.value,
+                        "provenance": earliest.provenance.value,
+                        "used": True,
+                        "slots_removed": removed,
+                        "options_remaining": len(filtered),
+                    },
+                )
+                options = filtered
+        elif pending_earliest is not None:
+            self.runtime.trace(
+                run_id,
+                "memory_read",
+                {
+                    "key": MemoryKey.EARLIEST_TIME.value,
+                    "value": pending_earliest.value,
+                    "status": pending_earliest.status.value,
+                    "provenance": pending_earliest.provenance.value,
+                    "used": False,
+                    "reason": "pending_confirmation",
+                },
+            )
+
+        preferred = self.memory.active_fact(user_id, MemoryKey.PREFERRED_PROVIDER_ID)
+        pending_preferred = self.memory.pending_fact(
+            user_id, MemoryKey.PREFERRED_PROVIDER_ID
+        )
+        if preferred is not None:
+            options = sorted(
+                options,
+                key=lambda option: (
+                    0 if option.provider_id == preferred.value else 1,
+                    -option.rating,
+                    option.price_inr,
+                    option.provider_id,
+                ),
+            )
+            self.runtime.trace(
+                run_id,
+                "memory_read",
+                {
+                    "key": MemoryKey.PREFERRED_PROVIDER_ID.value,
+                    "value": preferred.value,
+                    "status": preferred.status.value,
+                    "provenance": preferred.provenance.value,
+                    "used": True,
+                },
+            )
+        elif pending_preferred is not None:
+            self.runtime.trace(
+                run_id,
+                "memory_read",
+                {
+                    "key": MemoryKey.PREFERRED_PROVIDER_ID.value,
+                    "value": pending_preferred.value,
+                    "status": pending_preferred.status.value,
+                    "provenance": pending_preferred.provenance.value,
+                    "used": False,
+                    "reason": "pending_confirmation",
+                },
+            )
+        return options
+
+    @staticmethod
+    def _with_memory(turn: TurnResult, facts: list[MemoryFact]) -> TurnResult:
+        if facts:
+            turn.memory = facts
+        return turn
 
     # -- helpers ------------------------------------------------------------
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -12,10 +13,17 @@ from errand_agent.budget import BudgetCaps, BudgetKeeper
 from errand_agent.clock import IST, Clock, FakeClock, SystemClock
 from errand_agent.conversation import Conversation
 from errand_agent.db import Store
-from errand_agent.formatting import format_price, format_slot_range
+from errand_agent.formatting import format_price, format_slot, format_slot_range
 from errand_agent.guard import ExecutionGuard
 from errand_agent.model import ScriptedModel
-from errand_agent.models import RequiredSlot, RunState, TurnResult
+from errand_agent.models import (
+    FactStatus,
+    MemoryFact,
+    MemoryKey,
+    RequiredSlot,
+    RunState,
+    TurnResult,
+)
 from errand_agent.runtime import Runtime
 from errand_agent.toolbox import Toolbox
 from errand_agent.trace import Tracer
@@ -73,6 +81,14 @@ def build_app(
     )
 
 
+def format_memory_fact(fact: MemoryFact) -> str:
+    value = fact.value if fact.value is not None else "(forgotten)"
+    return (
+        f"{fact.key.value} = {value} "
+        f"({fact.provenance.value}, {fact.status.value})"
+    )
+
+
 def print_turn(user_text: str, turn: TurnResult) -> None:
     print(f"\nYou: {user_text}")
     for message in turn.messages:
@@ -80,6 +96,8 @@ def print_turn(user_text: str, turn: TurnResult) -> None:
         for index, line in enumerate(lines):
             prefix = "Agent:" if index == 0 else "      "
             print(f"{prefix} {line}" if line else prefix)
+    for fact in turn.memory:
+        print(f"[memory] {format_memory_fact(fact)}")
     print(f"[state: {turn.state.value}]")
 
 
@@ -199,6 +217,8 @@ FAULT_SCENARIOS = frozenset(
 
 
 def run_demo(args: argparse.Namespace) -> int:
+    if args.scenario == "memory":
+        return run_memory_demo(args)
     needs_clock = args.scenario in {"hold-expiry"}
     demo_clock = FakeClock(datetime.now(IST)) if needs_clock else None
     caps = BudgetCaps(turn_cap=1) if args.scenario == "limit-turns" else None
@@ -308,6 +328,179 @@ def run_chat(args: argparse.Namespace) -> int:
         app.close()
 
 
+def print_memory(app: App, user_id: str, *, include_forgotten: bool = False) -> None:
+    facts = app.conversation.list_memory(user_id, include_forgotten=include_forgotten)
+    if not facts:
+        print("[memory] No saved preferences.")
+        return
+    for fact in facts:
+        print(f"[memory] {format_memory_fact(fact)}")
+
+
+def run_memory(args: argparse.Namespace) -> int:
+    app = build_app(args.data_dir, user_id=args.user_id)
+    try:
+        if args.memory_command == "list":
+            print_memory(app, args.user_id, include_forgotten=args.all)
+            return 0
+        if args.memory_command == "remember":
+            fact = app.conversation.remember_memory(
+                args.user_id, args.key, args.value
+            )
+            label = "Remembered"
+        elif args.memory_command == "correct":
+            fact = app.conversation.correct_memory(
+                args.user_id, args.key, args.value
+            )
+            label = "Corrected"
+        elif args.memory_command == "confirm":
+            fact = app.conversation.confirm_memory(args.user_id, args.key)
+            label = "Confirmed"
+        elif args.memory_command == "forget":
+            fact = app.conversation.forget_memory(args.user_id, args.key)
+            label = "Forgot"
+        else:  # pragma: no cover - argparse restricts the choices
+            raise ValueError(f"unknown memory command: {args.memory_command}")
+        if fact is None:
+            print("No matching saved preference was found.")
+            return 1
+        print(f"{label}: {format_memory_fact(fact)}")
+        return 0
+    finally:
+        app.close()
+
+
+def run_memory_demo(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data_dir) / "memory-demo"
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+    clock = FakeClock(datetime(2026, 11, 2, 9, 0, tzinfo=IST))
+    app = build_app(data_dir, clock=clock, user_id=args.user_id)
+    try:
+        print("Errand Agent — memory demo")
+        print(f"User: {args.user_id}")
+
+        print("\n[session 1] Save an area with an explicit statement.")
+        first = app.conversation.start_run(
+            args.user_id, "Remember that I live in Indiranagar."
+        )
+        print_turn("Remember that I live in Indiranagar.", first)
+        area = app.conversation.memory.active_fact(args.user_id, MemoryKey.AREA)
+        if area is None or area.value != "Indiranagar":
+            raise RuntimeError("the stated area was not saved")
+        print_memory(app, args.user_id)
+
+        print("\n[session 2] A new session uses the saved area without asking.")
+        second = app.conversation.start_run(
+            args.user_id, "I need a plumber to fix a leaking tap this week."
+        )
+        print_turn("I need a plumber to fix a leaking tap this week.", second)
+        if second.state != RunState.OPTIONS_READY or second.requested_slot is not None:
+            raise RuntimeError("the saved area was not used in the new session")
+        early = sorted(
+            slot
+            for option in second.options
+            for slot in option.free_slots
+            if slot.hour < 9
+        )
+        if not early:
+            raise RuntimeError("the demo expected an early slot before confirmation")
+        print(
+            "[demo] Early slots still offered while the preference is unconfirmed: "
+            + ", ".join(format_slot(slot) for slot in early)
+        )
+
+        print("\n[session 2] The model suggests a hedged preference.")
+        inferred_turn = app.conversation.send_message(
+            second.run_id, "I usually start in the mornings."
+        )
+        print_turn("I usually start in the mornings.", inferred_turn)
+        pending = app.conversation.memory.pending_fact(
+            args.user_id, MemoryKey.EARLIEST_TIME
+        )
+        if pending is None or pending.status != FactStatus.PENDING_CONFIRMATION:
+            raise RuntimeError("the inferred preference was not pending")
+        print(
+            "[demo] Inferred and pending: "
+            f"earliest_time = {pending.value} (mornings) "
+            f"({pending.provenance.value}, {pending.status.value})"
+        )
+
+        print("\n[session 2] A pending inference is not used by a new search.")
+        pending_run = app.conversation.start_run(
+            args.user_id, "I need a plumber to fix a leaking tap this week."
+        )
+        print_turn("I need a plumber to fix a leaking tap this week.", pending_run)
+        pending_early = [
+            slot
+            for option in pending_run.options
+            for slot in option.free_slots
+            if slot.hour < 9
+        ]
+        if not pending_early:
+            raise RuntimeError("a pending inference changed the search")
+        print("[demo] The 08:00 slot is still offered while the inference is pending.")
+
+        confirmed = app.conversation.confirm_memory(
+            args.user_id, MemoryKey.EARLIEST_TIME
+        )
+        if confirmed is None or confirmed.status != FactStatus.ACTIVE:
+            raise RuntimeError("the inferred preference was not confirmed")
+        print(f"[demo] Confirmed: {format_memory_fact(confirmed)}")
+
+        print("\n[session 3] The confirmed earliest time filters the search.")
+        third = app.conversation.start_run(
+            args.user_id, "I need a plumber to fix a leaking tap this week."
+        )
+        print_turn("I need a plumber to fix a leaking tap this week.", third)
+        if third.state != RunState.OPTIONS_READY:
+            raise RuntimeError("the confirmed preference stopped the search")
+        early_after = [
+            slot
+            for option in third.options
+            for slot in option.free_slots
+            if slot.hour < 9
+        ]
+        if early_after:
+            raise RuntimeError("the confirmed earliest time was not applied")
+        print("[demo] The 08:00 slot is no longer offered.")
+
+        print("\n[session 3] Forget the area.")
+        forgotten = app.conversation.forget_memory(args.user_id, MemoryKey.AREA)
+        if forgotten is None or forgotten.status != FactStatus.FORGOTTEN:
+            raise RuntimeError("the area was not forgotten")
+        print(
+            f"[demo] Forgot area; tombstone {str(forgotten.tombstone_hash)[:12]}…"
+        )
+
+        print("\n[session 4] The forgotten area is not reused.")
+        fourth = app.conversation.start_run(
+            args.user_id, "I need a plumber to fix a leaking tap this week."
+        )
+        print_turn("I need a plumber to fix a leaking tap this week.", fourth)
+        if fourth.requested_slot != RequiredSlot.AREA:
+            raise RuntimeError("the forgotten area was reused")
+
+        old_message = app.store.list_messages(first.run_id)[0]
+        replayed = app.conversation.memory.record_stated(
+            args.user_id,
+            MemoryKey.AREA,
+            "Indiranagar",
+            source_turn_id=old_message.id,
+            occurred_at=old_message.created_at,
+        )
+        if replayed is not None:
+            raise RuntimeError("replaying old chat resurrected the forgotten area")
+        print("[demo] Replaying the old chat message did not restore the area.")
+
+        print("\n[memory] Final state:")
+        print_memory(app, args.user_id, include_forgotten=True)
+        print("\nMemory demo passed.")
+        return 0
+    finally:
+        app.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="errand",
@@ -333,9 +526,10 @@ def build_parser() -> argparse.ArgumentParser:
             "injection",
             "limit-turns",
             "unknown-error",
+            "memory",
         ),
         default="happy",
-        help="fault to inject after the first approval card",
+        help="fault or flow to run",
     )
     demo.set_defaults(handler=run_demo)
 
@@ -343,6 +537,41 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--data-dir", default=".errand")
     chat.add_argument("--user-id", default="user_raj")
     chat.set_defaults(handler=run_chat)
+
+    memory = subparsers.add_parser("memory", help="view and manage saved preferences")
+    memory.add_argument("--data-dir", default=".errand")
+    memory.add_argument("--user-id", default="user_raj")
+    memory_commands = memory.add_subparsers(dest="memory_command", required=True)
+
+    memory_list = memory_commands.add_parser("list", help="list saved preferences")
+    memory_list.add_argument(
+        "--all", action="store_true", help="include forgotten tombstones"
+    )
+    memory_list.set_defaults(handler=run_memory)
+
+    memory_remember = memory_commands.add_parser(
+        "remember", help="save a stated preference"
+    )
+    memory_remember.add_argument("key", choices=[key.value for key in MemoryKey])
+    memory_remember.add_argument("value")
+    memory_remember.set_defaults(handler=run_memory)
+
+    memory_correct = memory_commands.add_parser(
+        "correct", help="replace a saved preference"
+    )
+    memory_correct.add_argument("key", choices=[key.value for key in MemoryKey])
+    memory_correct.add_argument("value")
+    memory_correct.set_defaults(handler=run_memory)
+
+    memory_confirm = memory_commands.add_parser(
+        "confirm", help="confirm a pending inferred preference"
+    )
+    memory_confirm.add_argument("key", choices=[key.value for key in MemoryKey])
+    memory_confirm.set_defaults(handler=run_memory)
+
+    memory_forget = memory_commands.add_parser("forget", help="forget a preference")
+    memory_forget.add_argument("key", choices=[key.value for key in MemoryKey])
+    memory_forget.set_defaults(handler=run_memory)
     return parser
 
 
