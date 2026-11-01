@@ -2,12 +2,13 @@
 
 A local, offline errand booking agent with a code-enforced approval kernel.
 
-This repository currently implements tickets 01–08: a scripted CLI errand from
+This repository currently implements tickets 01–09: a scripted CLI errand from
 the first request to a verified booking, approval invalidation and hold expiry,
 timeout reconciliation with restart recovery, cancel/reschedule, untrusted
 review handling with injection defense, bounded execution with clear exits,
-memory with provenance and tombstones, and a browser chat with a live trace.
-Everything uses SQLite persistence and a JSONL trace.
+memory with provenance and tombstones, a browser chat with a live trace, and a
+memory panel in the same UI. Everything uses SQLite persistence and a JSONL
+trace.
 
 ## Run
 
@@ -37,6 +38,21 @@ file for the run.
 The web UI calls the same conversation seam as the CLI. It uses the same
 approval path: the card's buttons send the same `yes` or `no` decision that the
 typed parser receives.
+
+The **Memory** button in the top bar opens the memory panel. It lists every
+saved fact with its source (`You said` or `Inferred`) and status. An inferred
+fact is highlighted as pending and is not used by a search. **Confirm** applies
+it, **Correct** replaces the value and archives the old one, and **Forget**
+deletes the value and writes the same tombstone as the CLI or chat path. The
+panel and the chat share one per-user fact store, so a correction or a
+confirmation changes the next search.
+
+To see the full panel flow, chat `Remember that I live in Indiranagar`, start a
+plumber errand, then reply `I usually book the early slots`. Open **Memory**:
+the area is stated and active, the time is inferred and pending. Confirm the
+time, correct the area, then start a new errand without naming an area. The next
+search uses the corrected area and the confirmed earliest time. Forget the area
+and a new session asks for it again.
 
 To demonstrate reconciliation in the browser, start the server with the
 timeout-after-success fault:
@@ -180,7 +196,9 @@ not restore the forgotten area. `memory list --all` also shows tombstones.
   `pending_confirmation`; the search does not use it until the user confirms.
   Corrections archive the old value. Forget deletes the value, marks the fact
   `forgotten`, and writes a tombstone hash. A replayed old message cannot
-  resurrect it, and a new session never reads it.
+  resurrect it, and a new session never reads it. The browser memory panel calls
+  the same conversation methods, so its correct, confirm, and forget actions
+  write the same records and trace events as the chat and CLI paths.
 - Every run writes a JSONL trace plus an indexed copy of the events in SQLite.
   Timeout runs show `book` error → `get_booking_status` → `reconciliation` →
   `run_finished`.

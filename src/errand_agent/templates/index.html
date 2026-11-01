@@ -20,6 +20,11 @@
       </a>
       <div class="topbar-meta">
         <span class="local-status"><span class="status-dot" aria-hidden="true"></span>Local, offline</span>
+        <button class="button button-quiet memory-button" id="memory-button" type="button" aria-haspopup="dialog" aria-controls="memory-dialog">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 4.5h10M3 8h10M3 11.5h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <span>Memory</span>
+          <span class="memory-count" id="memory-count" hidden>0</span>
+        </button>
         <button class="button button-quiet" id="new-errand" type="button" hidden>New errand</button>
       </div>
     </header>
@@ -130,6 +135,36 @@
       </aside>
     </main>
   </div>
+
+  <dialog class="memory-dialog" id="memory-dialog" aria-labelledby="memory-heading">
+    <div class="memory-sheet">
+      <header class="memory-head">
+        <div class="memory-head-copy">
+          <h2 class="memory-title" id="memory-heading">Memory</h2>
+          <p class="memory-subtitle" id="memory-subtitle">What the agent remembers about you.</p>
+        </div>
+        <button class="memory-close" id="memory-close" type="button" aria-label="Close memory panel">
+          <svg width="17" height="17" viewBox="0 0 18 18" fill="none" aria-hidden="true"><path d="m5 5 8 8M13 5l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+
+      <div class="memory-scroll" id="memory-scroll">
+        <div class="memory-empty" id="memory-empty" hidden>
+          <p class="memory-empty-title">Nothing saved yet.</p>
+          <p class="memory-empty-copy">Tell the agent <strong>“Remember that I live in Indiranagar”</strong> or <strong>“I prefer mornings”</strong>, and the fact appears here with its source.</p>
+        </div>
+
+        <p class="memory-note" id="memory-note" hidden></p>
+
+        <ul class="memory-list" id="memory-list" aria-label="Saved preferences"></ul>
+        <datalist id="memory-areas"></datalist>
+      </div>
+
+      <footer class="memory-foot">
+        <p class="memory-foot-copy">Facts are keyed to the person, not the errand, and changes apply to the next search. Pending inferences stay unused until you confirm them.</p>
+      </footer>
+    </div>
+  </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <div class="sr-only" id="trace-announcer" role="status" aria-live="polite"></div>
