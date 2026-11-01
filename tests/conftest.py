@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,60 @@ def app(tmp_path, clock) -> TestApp:
         clock=clock,
     )
     store.close()
+
+
+@pytest.fixture
+def rebuild_app(app: TestApp):
+    """Build fresh kernel components over the same database and world."""
+
+    def _rebuild() -> TestApp:
+        app.store.close()
+        store = Store(app.store.path)
+        tracer = Tracer(app.tracer.base_dir, store, app.clock)
+        model = ScriptedModel()
+        runtime = Runtime(store, tracer, app.clock)
+        toolbox = Toolbox(app.world, tracer, app.clock)
+        guard = ExecutionGuard(store, toolbox, runtime, app.clock)
+        conversation = Conversation(
+            store,
+            app.world,
+            tracer,
+            app.clock,
+            model,
+            runtime=runtime,
+            toolbox=toolbox,
+            guard=guard,
+        )
+        return TestApp(
+            store=store,
+            world=app.world,
+            tracer=tracer,
+            conversation=conversation,
+            guard=guard,
+            clock=app.clock,
+        )
+
+    return _rebuild
+
+
+@pytest.fixture
+def seed_booking(app: TestApp):
+    def _seed(
+        provider_id: str = "prov_plumber_ind_1",
+        *,
+        user_id: str = "user_raj",
+        slot_index: int = 0,
+    ):
+        now = app.clock.now()
+        results = app.world.search_providers(
+            "plumber", "Indiranagar", (now, now + timedelta(days=7))
+        )
+        result = next(item for item in results if item.provider_id == provider_id)
+        return app.world.seed_booking(
+            provider_id, result.free_slots[slot_index], user_id=user_id
+        )
+
+    return _seed
 
 
 @pytest.fixture

@@ -102,8 +102,9 @@ class ProviderOption(BaseModel):
 
 class ApprovalCard(BaseModel):
     proposal_id: str
-    hold_id: str
+    hold_id: str | None
     action: Action
+    booking_id: str | None = None
     provider_id: str
     provider_name: str
     slot_start: datetime
@@ -117,6 +118,7 @@ class ApprovalCard(BaseModel):
 class RunRecord(BaseModel):
     id: str
     user_id: str
+    action: Action = Action.BOOK
     state: RunState
     slots: ErrandSlots = Field(default_factory=ErrandSlots)
     options: list[ProviderOption] = Field(default_factory=list)
@@ -160,7 +162,7 @@ class Proposal(BaseModel):
     slot_end: datetime
     quoted_price_inr: int
     quote_version: int
-    hold_id: str
+    hold_id: str | None
     expires_at: datetime
     state: ProposalState
     binding_hash: str

@@ -45,6 +45,94 @@ def test_demo_quote_change_scenario_reapproves_and_books_once(tmp_path, capsys, 
     assert len(books) == 1
 
 
+def test_demo_timeout_after_success_reconciles_and_books_once(
+    tmp_path, capsys, read_trace
+) -> None:
+    data_dir = tmp_path / "data"
+    code = main(["demo", "--data-dir", str(data_dir), "--scenario", "timeout-after-success"])
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "Final state: completed" in captured.out
+    assert "Bookings recorded: 1" in captured.out
+
+    events = read_trace(next((data_dir / "traces").glob("*.jsonl")))
+    assert any(
+        event["type"] == "tool_call"
+        and event["payload"].get("name") == "book"
+        and event["payload"].get("error", "").startswith("ProviderTimeout")
+        for event in events
+    )
+    assert any(event["type"] == "reconciliation" for event in events)
+
+
+def test_demo_restart_recovery_books_once(tmp_path, capsys, read_trace) -> None:
+    data_dir = tmp_path / "data"
+    code = main(["demo", "--data-dir", str(data_dir), "--scenario", "restart-mid-booking"])
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "The agent process died mid-booking" in captured.out
+    assert "recovered after restart" in captured.out
+    assert "Final state: completed" in captured.out
+    assert "Bookings recorded: 1" in captured.out
+
+    events = read_trace(next((data_dir / "traces").glob("*.jsonl")))
+    assert any(
+        event["type"] == "reconciliation" and event["payload"].get("source") == "restart"
+        for event in events
+    )
+    assert events[-1]["type"] == "run_finished"
+    assert events[-1]["payload"]["state"] == "completed"
+
+
+def test_demo_cancel_retries_the_503_and_cancels(tmp_path, capsys, read_trace) -> None:
+    data_dir = tmp_path / "data"
+    code = main(["demo", "--data-dir", str(data_dir), "--scenario", "cancel"])
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "Final state: cancelled" in captured.out
+    assert "Bookings recorded: 0" in captured.out
+
+    events = read_trace(next((data_dir / "traces").glob("*.jsonl")))
+    cancel_events = [
+        event
+        for event in events
+        if event["type"] == "tool_call" and event["payload"].get("name") == "cancel"
+    ]
+    assert [event["payload"]["attempt"] for event in cancel_events] == [1, 2]
+    assert cancel_events[1]["payload"].get("error") is None
+
+
+def test_demo_reschedule_conflict_reapproves_and_reschedules(
+    tmp_path, capsys, read_trace
+) -> None:
+    data_dir = tmp_path / "data"
+    code = main(["demo", "--data-dir", str(data_dir), "--scenario", "reschedule-conflict"])
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "Final state: completed" in captured.out
+    assert "Bookings recorded: 1" in captured.out
+
+    events = read_trace(next((data_dir / "traces").glob("*.jsonl")))
+    assert sum(event["type"] == "approval_requested" for event in events) == 2
+    assert any(
+        event["type"] == "reconciliation"
+        and event["payload"].get("outcome") == "slot_conflict"
+        for event in events
+    )
+    reschedules = [
+        event
+        for event in events
+        if event["type"] == "tool_call" and event["payload"].get("name") == "reschedule"
+    ]
+    assert len(reschedules) == 2
+    assert reschedules[0]["payload"].get("error")
+    assert reschedules[1]["payload"].get("error") is None
+
+
 def test_demo_hold_expiry_scenario_reholds_and_books_once(tmp_path, capsys, read_trace) -> None:
     data_dir = tmp_path / "data"
     code = main(["demo", "--data-dir", str(data_dir), "--scenario", "hold-expiry"])

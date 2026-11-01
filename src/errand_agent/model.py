@@ -19,6 +19,7 @@ from errand_agent.formatting import (
     format_slot_range,
 )
 from errand_agent.models import (
+    Action,
     ApprovalCard,
     BookingRecord,
     ErrandSlots,
@@ -26,6 +27,7 @@ from errand_agent.models import (
     RequiredSlot,
     TimeWindow,
 )
+from errand_agent.world import WorldBooking
 
 SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "plumber": ("plumber", "plumbing", "leak", "leaking", "tap", "pipe", "drain", "water"),
@@ -70,6 +72,25 @@ class DraftRequest:
 
 class ScriptedModel:
     name = "scripted-v1"
+
+    @staticmethod
+    def extract_action(text: str) -> Action:
+        """Deterministic intent parser. The model proposes, the kernel disposes."""
+        lowered = text.lower()
+        if any(
+            phrase in lowered
+            for phrase in (
+                "reschedule",
+                "move my booking",
+                "move the booking",
+                "change my booking",
+                "change the booking",
+            )
+        ):
+            return Action.RESCHEDULE
+        if any(phrase in lowered for phrase in ("cancel", "call off", "drop my booking")):
+            return Action.CANCEL
+        return Action.BOOK
 
     def extract(self, text: str, context: ExtractionContext) -> ErrandSlots:
         slots = ErrandSlots()
@@ -225,8 +246,45 @@ class ScriptedModel:
             )
         if request.kind == "already_booked":
             return self._draft_booked(data["booking"], data["trace_path"])
+        if request.kind == "select_booking":
+            return self._draft_select_booking(data["bookings"], data["action"])
+        if request.kind == "no_bookings":
+            return (
+                f"You have no {data['action']}able bookings right now. "
+                f"Nothing was changed.\nTrace: {data['trace_path']}"
+            )
+        if request.kind == "cancel_approval":
+            return self._draft_cancel_approval(data["card"], data["booking"])
+        if request.kind == "reschedule_approval":
+            return self._draft_reschedule_approval(data["card"], data["booking"])
         if request.kind == "cancelled":
-            return "Cancelled. No booking was made."
+            return self._draft_cancelled(data["booking"], data["trace_path"])
+        if request.kind == "rescheduled":
+            return self._draft_rescheduled(data["booking"], data["trace_path"])
+        if request.kind == "cancel_declined":
+            return "No cancellation was made. Your booking is unchanged."
+        if request.kind == "reschedule_declined":
+            return "No reschedule was made. Your booking is unchanged."
+        if request.kind == "cancel_failed":
+            return (
+                "I couldn't cancel safely after retrying, so your booking is unchanged. "
+                f"Nothing was cancelled.\nTrace: {data['trace_path']}"
+            )
+        if request.kind == "reschedule_failed":
+            return (
+                "I couldn't move the booking safely, so it is unchanged. "
+                f"Nothing was rescheduled.\nTrace: {data['trace_path']}"
+            )
+        if request.kind == "no_reschedule_slots":
+            return (
+                "I couldn't find another free slot with that provider for "
+                f"{data['time_label']}. Nothing was changed.\nTrace: {data['trace_path']}"
+            )
+        if request.kind == "recovery_parked":
+            return (
+                "I recovered a booking attempt after a restart but could not confirm it safely. "
+                f"Nothing new will be booked.\nTrace: {data['trace_path']}"
+            )
         raise ValueError(f"unknown draft kind: {request.kind}")
 
     @staticmethod
@@ -260,12 +318,13 @@ class ScriptedModel:
 
     @staticmethod
     def _approval_lines(card: ApprovalCard) -> list[str]:
+        expiry_label = "Hold expires" if card.hold_id is not None else "Approval expires"
         return [
             f"Action: {card.action.value}",
             f"Provider: {card.provider_name} ({card.provider_id})",
             f"Slot: {format_slot_range(card.slot_start, card.slot_end)}",
             f"Price: {format_price(card.quoted_price_inr)}",
-            f"Hold expires: {format_expiry(card.expires_at)}",
+            f"{expiry_label}: {format_expiry(card.expires_at)}",
         ]
 
     @staticmethod
@@ -303,6 +362,11 @@ class ScriptedModel:
                 f"The slot changed from {format_slot_range(old_start, old_end)} to "
                 f"{format_slot_range(card.slot_start, card.slot_end)}."
             )
+        elif reason == "slot_conflict":
+            intro = (
+                "That new slot was taken, so the old approval is void and the booking "
+                "did not move. I found another free slot with the same provider."
+            )
         elif reason == "proposal_changed":
             intro = (
                 "The proposal changed after your approval, so the old approval is void. "
@@ -313,15 +377,89 @@ class ScriptedModel:
                 "The provider quote changed after your approval, so the old approval is void. "
                 "I held the slot again and got a fresh quote."
             )
+        booking = data.get("booking")
+        booking_line = f"Booking ID: {booking.id}" if booking is not None else None
+        lines = [
+            intro,
+            "",
+            "Here is the new exact approval:",
+            "",
+            *ScriptedModel._approval_lines(card),
+        ]
+        if booking_line is not None:
+            lines.append(booking_line)
+        lines.extend(["", 'Reply "yes" to approve or "no" to decline.'])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _draft_select_booking(bookings: list[WorldBooking], action: Action) -> str:
+        verb = "cancel" if action == Action.CANCEL else "move"
+        lines = [f"You have {len(bookings)} upcoming bookings:", ""]
+        for index, booking in enumerate(bookings, start=1):
+            lines.append(
+                f"{index}. {booking.provider_name} — "
+                f"{format_slot_range(booking.slot_start, booking.slot_end)} — "
+                f"{booking.id}"
+            )
+        lines.extend(["", f"Reply with the number of the booking you want to {verb}."])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _draft_cancel_approval(card: ApprovalCard, booking: BookingRecord) -> str:
         return "\n".join(
             [
-                intro,
+                f"I'm ready to cancel {booking.provider_name} for "
+                f"{format_slot_range(booking.slot_start, booking.slot_end)}.",
                 "",
-                "Here is the new exact approval:",
+                "Here is the exact approval:",
                 "",
                 *ScriptedModel._approval_lines(card),
+                "Refund: ₹0 (full refund)",
+                f"Booking ID: {booking.id}",
                 "",
                 'Reply "yes" to approve or "no" to decline.',
+            ]
+        )
+
+    @staticmethod
+    def _draft_reschedule_approval(card: ApprovalCard, booking: BookingRecord) -> str:
+        return "\n".join(
+            [
+                f"I'll move your {booking.provider_name} booking from "
+                f"{format_slot_range(booking.slot_start, booking.slot_end)}.",
+                "",
+                "Here is the exact approval:",
+                "",
+                *ScriptedModel._approval_lines(card),
+                f"Booking ID: {booking.id}",
+                "",
+                'Reply "yes" to approve or "no" to decline.',
+            ]
+        )
+
+    @staticmethod
+    def _draft_cancelled(booking: BookingRecord, trace_path: str) -> str:
+        return "\n".join(
+            [
+                "Cancelled and verified.",
+                f"Provider: {booking.provider_name}",
+                f"Slot: {format_slot_range(booking.slot_start, booking.slot_end)}",
+                "Refund: ₹0 (full refund)",
+                f"Booking ID: {booking.id}",
+                f"Trace: {trace_path}",
+            ]
+        )
+
+    @staticmethod
+    def _draft_rescheduled(booking: BookingRecord, trace_path: str) -> str:
+        return "\n".join(
+            [
+                "Rescheduled and verified.",
+                f"Provider: {booking.provider_name}",
+                f"New slot: {format_slot_range(booking.slot_start, booking.slot_end)}",
+                f"Price: {format_price(booking.price_inr)}",
+                f"Booking ID: {booking.id}",
+                f"Trace: {trace_path}",
             ]
         )
 

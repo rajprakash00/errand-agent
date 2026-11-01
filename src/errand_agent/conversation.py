@@ -24,10 +24,12 @@ from errand_agent.dialogue import (
     parse_option_selection,
 )
 from errand_agent.guard import (
+    CancelFailed,
     ExecutionFailed,
     ExecutionGuard,
     ExecutionInProgress,
     QuoteChanged,
+    RescheduleConflict,
     VerificationFailed,
 )
 from errand_agent.ids import new_id
@@ -44,12 +46,19 @@ from errand_agent.models import (
     ProviderOption,
     RequiredSlot,
     RunState,
+    TimeWindow,
     TurnResult,
 )
 from errand_agent.runtime import Runtime
 from errand_agent.toolbox import Toolbox
 from errand_agent.trace import Tracer
-from errand_agent.world import Hold, MockProviderWorld, SlotUnavailable
+from errand_agent.world import (
+    HOLD_MINUTES,
+    Hold,
+    MockProviderWorld,
+    SlotUnavailable,
+    WorldBooking,
+)
 
 SLOT_LENGTH = timedelta(minutes=60)
 
@@ -83,20 +92,46 @@ class Conversation:
     # -- public seam --------------------------------------------------------
 
     def start_run(self, user_id: str, text: str) -> TurnResult:
+        action = self.model.extract_action(text)
         run_id = new_id("run")
         trace_path = str(self.tracer.path_for(run_id))
         now = self.clock.now()
-        self.store.create_run(run_id, user_id, RunState.INTAKE, trace_path, now)
-        self.runtime.trace(run_id, "run_started", {"user_id": user_id, "trace_version": 1})
+        self.store.create_run(run_id, user_id, RunState.INTAKE, trace_path, now, action=action)
+        self.runtime.trace(
+            run_id,
+            "run_started",
+            {"user_id": user_id, "action": action.value, "trace_version": 1},
+        )
         self.runtime.user_message(run_id, text)
+        self.runtime.trace(
+            run_id,
+            "model_call",
+            {
+                "model": self.model.name,
+                "role": "extract_intent",
+                "prompt_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "message_count": 1,
+                "tool_names": [],
+                "tokens": 0,
+                "cost": 0.0,
+                "excerpt": text[:200],
+                "result": action.value,
+            },
+        )
         self.runtime.transition(run_id, RunState.COLLECTING, reason="intake")
+        if action == Action.CANCEL:
+            return self._collect_cancel(run_id, text)
+        if action == Action.RESCHEDULE:
+            return self._collect_reschedule(run_id, text)
         return self._collect(run_id, text)
 
     def send_message(self, run_id: str, text: str) -> TurnResult:
         run = self.store.require_run(run_id)
         if is_terminal(run.state):
             latest = self.store.get_latest_proposal_for_run(run_id)
-            booking = self.store.get_booking_by_proposal(latest.id) if latest is not None else None
+            booking = None
+            if latest is not None and latest.action == Action.BOOK:
+                booking = self.store.get_booking_by_proposal(latest.id)
             if booking is not None:
                 # A repeated confirmation after completion returns the existing
                 # booking. It never writes an approval or calls book again.
@@ -108,13 +143,21 @@ class Conversation:
                 )
                 self.runtime.assistant_message(run_id, message)
                 return self._turn(run_id, [message], booking=booking)
-            message = "This errand is already finished. Start a new errand."
+            message = "This errand is already finished. Nothing else was changed."
             self.runtime.assistant_message(run_id, message)
             return self._turn(run_id, [message])
         self.runtime.user_message(run_id, text)
         if run.state == RunState.COLLECTING:
+            if run.action == Action.CANCEL:
+                return self._collect_cancel(run_id, text)
+            if run.action == Action.RESCHEDULE:
+                return self._collect_reschedule(run_id, text)
             return self._collect(run_id, text)
         if run.state == RunState.OPTIONS_READY:
+            if run.action == Action.CANCEL:
+                return self._collect_cancel(run_id, text)
+            if run.action == Action.RESCHEDULE:
+                return self._collect_reschedule(run_id, text)
             return self._select_option(run_id, text)
         if run.state == RunState.AWAITING_APPROVAL:
             return self._handle_confirmation(run_id, text)
@@ -123,6 +166,64 @@ class Conversation:
             self.runtime.assistant_message(run_id, message)
             return self._turn(run_id, [message])
         raise ConversationError(f"cannot handle a message in state {run.state.value}")
+
+    def recover_pending(self) -> list[TurnResult]:
+        """Finish intents that a previous process left in flight."""
+        turns: list[TurnResult] = []
+        for outcome in self.guard.recover_pending():
+            run = self.store.require_run(outcome.run_id)
+            if outcome.target_state == RunState.COMPLETED and outcome.booking is not None:
+                if outcome.action == Action.RESCHEDULE:
+                    message = self._draft(
+                        run.id,
+                        "rescheduled",
+                        {"booking": outcome.booking, "trace_path": run.trace_path},
+                    )
+                else:
+                    message = self._draft(
+                        run.id,
+                        "booked",
+                        {"booking": outcome.booking, "trace_path": run.trace_path},
+                    )
+            elif outcome.target_state == RunState.CANCELLED and outcome.booking is not None:
+                message = self._draft(
+                    run.id,
+                    "cancelled",
+                    {"booking": outcome.booking, "trace_path": run.trace_path},
+                )
+            elif outcome.target_state == RunState.FAILED:
+                if outcome.action == Action.CANCEL:
+                    message = self._draft(
+                        run.id, "cancel_failed", {"trace_path": run.trace_path}
+                    )
+                elif outcome.action == Action.RESCHEDULE:
+                    message = self._draft(
+                        run.id, "reschedule_failed", {"trace_path": run.trace_path}
+                    )
+                else:
+                    message = self._draft(
+                        run.id,
+                        "failed",
+                        {"reason": outcome.reason, "trace_path": run.trace_path},
+                    )
+            else:
+                message = self._draft(
+                    run.id, "recovery_parked", {"trace_path": run.trace_path}
+                )
+            self.runtime.finish(
+                run.id,
+                outcome.target_state,
+                message,
+                {
+                    "recovered": True,
+                    "recovery_reason": outcome.reason,
+                    "proposal_id": outcome.proposal_id,
+                },
+            )
+            turns.append(
+                self._turn(run.id, [message], booking=outcome.booking)
+            )
+        return turns
 
     # -- collecting ---------------------------------------------------------
 
@@ -228,6 +329,274 @@ class Conversation:
         self.runtime.assistant_message(run_id, message)
         return self._turn(run_id, [message], options=options)
 
+    # -- cancel -------------------------------------------------------------
+
+    def _collect_cancel(self, run_id: str, text: str) -> TurnResult:
+        run = self.store.require_run(run_id)
+        bookings = self._active_bookings(run_id, run.user_id)
+        if not bookings:
+            self._begin_booking_search(run_id, reason="booking lookup")
+            self.runtime.transition(run_id, RunState.NEEDS_HUMAN, reason="no bookings")
+            message = self._draft(
+                run_id,
+                "no_bookings",
+                {"action": "cancel", "trace_path": run.trace_path},
+            )
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message])
+
+        index = self._select_booking(text, bookings)
+        if index is None:
+            self.runtime.transition(
+                run_id, RunState.COLLECTING, reason="awaiting booking selection"
+            )
+            message = self._draft(
+                run_id,
+                "select_booking",
+                {"bookings": bookings, "action": Action.CANCEL},
+            )
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message])
+
+        booking = bookings[index]
+        self._begin_booking_search(run_id, reason="booking lookup")
+        local = self._mirror_booking(booking)
+        self.runtime.transition(run_id, RunState.OPTIONS_READY, reason="booking selected")
+        self.runtime.transition(run_id, RunState.HOLDING, reason="prepare cancel proposal")
+        return self._propose_cancel(run_id, local)
+
+    def _propose_cancel(self, run_id: str, booking: BookingRecord) -> TurnResult:
+        run = self.store.require_run(run_id)
+        now = self.clock.now()
+        expires_at = now + timedelta(minutes=HOLD_MINUTES)
+        proposal = Proposal(
+            id=new_id("prop"),
+            run_id=run_id,
+            user_id=run.user_id,
+            action=Action.CANCEL,
+            booking_id=booking.id,
+            provider_id=booking.provider_id,
+            slot_start=booking.slot_start,
+            slot_end=booking.slot_end,
+            quoted_price_inr=0,
+            quote_version=1,
+            hold_id=None,
+            expires_at=expires_at,
+            state=ProposalState.HELD,
+            binding_hash="",
+            created_at=now,
+            updated_at=now,
+        )
+        proposal.binding_hash = compute_binding_hash(proposal)
+        self.store.create_proposal(proposal)
+        self.store.update_proposal_state(proposal.id, ProposalState.AWAITING_APPROVAL, now)
+        proposal.state = ProposalState.AWAITING_APPROVAL
+        self.runtime.transition(run_id, RunState.AWAITING_APPROVAL, reason="cancel proposal")
+
+        card = ApprovalCard(
+            proposal_id=proposal.id,
+            hold_id=None,
+            action=proposal.action,
+            booking_id=booking.id,
+            provider_id=proposal.provider_id,
+            provider_name=booking.provider_name,
+            slot_start=proposal.slot_start,
+            slot_end=proposal.slot_end,
+            quoted_price_inr=proposal.quoted_price_inr,
+            quote_version=proposal.quote_version,
+            expires_at=proposal.expires_at,
+            binding_hash=proposal.binding_hash,
+        )
+        self.runtime.trace(
+            run_id,
+            "approval_requested",
+            {
+                "proposal_id": proposal.id,
+                "hold_id": None,
+                "action": proposal.action.value,
+                "booking_id": booking.id,
+                "provider_id": proposal.provider_id,
+                "provider_name": booking.provider_name,
+                "slot_start": proposal.slot_start,
+                "slot_end": proposal.slot_end,
+                "quoted_price_inr": proposal.quoted_price_inr,
+                "quote_version": proposal.quote_version,
+                "expires_at": proposal.expires_at,
+                "refund_inr": 0,
+                "binding_hash": proposal.binding_hash,
+            },
+        )
+        message = self._draft(
+            run_id,
+            "cancel_approval",
+            {"card": card, "booking": booking},
+        )
+        self.runtime.assistant_message(run_id, message)
+        return self._turn(run_id, [message], approval=card)
+
+    # -- reschedule ---------------------------------------------------------
+
+    def _collect_reschedule(self, run_id: str, text: str) -> TurnResult:
+        run = self.store.require_run(run_id)
+        extracted = self._extract(run_id, text, RequiredSlot.TIME_WINDOW, run.slots)
+        merged = merge_slots(run.slots, extracted)
+        self.store.update_run_slots(run_id, merged, self.clock.now())
+        run = self.store.require_run(run_id)
+
+        bookings = self._active_bookings(run_id, run.user_id)
+        if not bookings:
+            self._begin_booking_search(run_id, reason="booking lookup")
+            self.runtime.transition(run_id, RunState.NEEDS_HUMAN, reason="no bookings")
+            message = self._draft(
+                run_id,
+                "no_bookings",
+                {"action": "reschedule", "trace_path": run.trace_path},
+            )
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message])
+
+        index = self._select_booking(text, bookings)
+        if index is None:
+            self.runtime.transition(
+                run_id, RunState.COLLECTING, reason="awaiting booking selection"
+            )
+            message = self._draft(
+                run_id,
+                "select_booking",
+                {"bookings": bookings, "action": Action.RESCHEDULE},
+            )
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message])
+
+        if run.slots.time_window is None:
+            self.runtime.transition(
+                run_id, RunState.COLLECTING, reason="awaiting new time window"
+            )
+            message = self._draft(run_id, "ask_slot", {"slot": RequiredSlot.TIME_WINDOW})
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message], requested_slot=RequiredSlot.TIME_WINDOW)
+
+        booking = bookings[index]
+        window = run.slots.time_window
+        self._begin_booking_search(run_id, reason="reschedule requested")
+        local = self._mirror_booking(booking)
+        options = self._reschedule_options(run_id, local, window)
+        _, slots = self._reschedule_candidates(options, local, set())
+        if not slots:
+            self.runtime.transition(
+                run_id, RunState.NEEDS_HUMAN, reason="no replacement slots"
+            )
+            message = self._draft(
+                run_id,
+                "no_reschedule_slots",
+                {"time_label": window.label, "trace_path": run.trace_path},
+            )
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message])
+
+        self.runtime.transition(run_id, RunState.OPTIONS_READY, reason="replacement slot found")
+        self.runtime.transition(run_id, RunState.HOLDING, reason="reschedule hold")
+        return self._hold_and_request_approval(
+            run_id,
+            provider_id=local.provider_id,
+            slot_start=slots[0],
+            slot_end=slots[0] + SLOT_LENGTH,
+            draft_kind="reschedule_approval",
+            options=options,
+            action=Action.RESCHEDULE,
+            booking_id=local.id,
+            booking=local,
+        )
+
+    def _reschedule_options(
+        self, run_id: str, booking: BookingRecord, window: TimeWindow
+    ) -> list[ProviderOption]:
+        details = self.toolbox.call(
+            run_id, "get_provider", provider_id=booking.provider_id
+        )
+        results = self.toolbox.call(
+            run_id,
+            "search_providers",
+            service=details.service,
+            area=details.area,
+            date_range=(window.start, window.end),
+        )
+        options = [
+            ProviderOption(
+                provider_id=result.provider_id,
+                name=result.name,
+                price_inr=result.price_inr,
+                rating=result.rating,
+                free_slots=result.free_slots,
+                attributes=result.attributes,
+            )
+            for result in results
+        ]
+        self.store.update_run_options(run_id, options, self.clock.now())
+        return options
+
+    def _reschedule_candidates(
+        self,
+        options: list[ProviderOption],
+        booking: BookingRecord,
+        exclude: set[datetime],
+    ) -> tuple[ProviderOption | None, list[datetime]]:
+        option = next(
+            (item for item in options if item.provider_id == booking.provider_id), None
+        )
+        if option is None:
+            return None, []
+        slots = [
+            slot
+            for slot in option.free_slots
+            if slot != booking.slot_start and slot not in exclude
+        ]
+        return option, sorted(slots)
+
+    def _repropose_after_conflict(
+        self, run_id: str, proposal: Proposal, conflict: RescheduleConflict
+    ) -> TurnResult:
+        run = self.store.require_run(run_id)
+        booking = self.store.get_booking_by_id(proposal.booking_id or "")
+        if booking is None:
+            message = self._draft(
+                run_id, "reschedule_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.NEEDS_HUMAN, message)
+            return self._turn(run_id, [message])
+        exclude = {conflict.slot_start, proposal.slot_start}
+        _, slots = self._reschedule_candidates(run.options, booking, exclude)
+        if not slots:
+            window_label = run.slots.time_window.label if run.slots.time_window else "that window"
+            message = self._draft(
+                run_id,
+                "no_reschedule_slots",
+                {"time_label": window_label, "trace_path": run.trace_path},
+            )
+            self.runtime.finish(run_id, RunState.NEEDS_HUMAN, message)
+            return self._turn(run_id, [message])
+
+        self.runtime.transition(run_id, RunState.OPTIONS_READY, reason="reschedule replacement")
+        self.runtime.transition(run_id, RunState.HOLDING, reason="reschedule re-hold")
+        return self._hold_and_request_approval(
+            run_id,
+            provider_id=booking.provider_id,
+            slot_start=slots[0],
+            slot_end=slots[0] + SLOT_LENGTH,
+            draft_kind="reapproval",
+            options=run.options,
+            draft_extra={
+                "reason": "slot_conflict",
+                "old_price_inr": proposal.quoted_price_inr,
+                "old_slot_start": conflict.slot_start,
+                "old_slot_end": conflict.slot_start + SLOT_LENGTH,
+            },
+            supersedes=proposal,
+            action=Action.RESCHEDULE,
+            booking_id=booking.id,
+            booking=booking,
+        )
+
     # -- hold and approval --------------------------------------------------
 
     def _select_option(self, run_id: str, text: str) -> TurnResult:
@@ -270,6 +639,9 @@ class Conversation:
         options: list[ProviderOption],
         draft_extra: dict[str, object] | None = None,
         supersedes: Proposal | None = None,
+        action: Action = Action.BOOK,
+        booking_id: str | None = None,
+        booking: BookingRecord | None = None,
     ) -> TurnResult:
         run = self.store.require_run(run_id)
         try:
@@ -306,8 +678,8 @@ class Conversation:
             id=new_id("prop"),
             run_id=run_id,
             user_id=run.user_id,
-            action=Action.BOOK,
-            booking_id=None,
+            action=action,
+            booking_id=booking_id,
             provider_id=hold.provider_id,
             slot_start=hold.slot_start,
             slot_end=hold.slot_end,
@@ -330,6 +702,7 @@ class Conversation:
             proposal_id=proposal.id,
             hold_id=hold.id,
             action=proposal.action,
+            booking_id=booking_id,
             provider_id=proposal.provider_id,
             provider_name=hold.provider_name,
             slot_start=proposal.slot_start,
@@ -343,6 +716,7 @@ class Conversation:
             "proposal_id": proposal.id,
             "hold_id": hold.id,
             "action": proposal.action.value,
+            "booking_id": booking_id,
             "provider_id": proposal.provider_id,
             "provider_name": hold.provider_name,
             "slot_start": proposal.slot_start,
@@ -357,7 +731,10 @@ class Conversation:
             trace_payload["reason"] = (draft_extra or {}).get("reason")
         self.runtime.trace(run_id, "approval_requested", trace_payload)
 
-        message = self._draft(run_id, draft_kind, {"card": card, **(draft_extra or {})})
+        draft_data: dict[str, object] = {"card": card, **(draft_extra or {})}
+        if booking is not None:
+            draft_data["booking"] = booking
+        message = self._draft(run_id, draft_kind, draft_data)
         self.runtime.assistant_message(run_id, message)
         return self._turn(run_id, [message], options=options, approval=card)
 
@@ -368,7 +745,7 @@ class Conversation:
         proposal = self.store.get_pending_proposal_for_run(run_id)
         if proposal is None:
             latest = self.store.get_latest_proposal_for_run(run_id)
-            if latest is not None:
+            if latest is not None and latest.action == Action.BOOK:
                 booking = self.store.get_booking_by_proposal(latest.id)
                 if booking is not None:
                     message = self._draft(
@@ -395,22 +772,31 @@ class Conversation:
 
         if decision == "no":
             self._decline(run_id, proposal)
-            message = self._draft(
-                run_id,
-                "declined",
-                {
-                    "service": run.slots.service or "provider",
-                    "area": run.slots.area or "your area",
-                    "time_label": (
-                        run.slots.time_window.label if run.slots.time_window else "this week"
-                    ),
-                    "options": run.options,
-                },
-            )
+            if proposal.action == Action.CANCEL:
+                message = self._draft(run_id, "cancel_declined", {})
+            elif proposal.action == Action.RESCHEDULE:
+                message = self._draft(run_id, "reschedule_declined", {})
+            else:
+                message = self._draft(
+                    run_id,
+                    "declined",
+                    {
+                        "service": run.slots.service or "provider",
+                        "area": run.slots.area or "your area",
+                        "time_label": (
+                            run.slots.time_window.label if run.slots.time_window else "this week"
+                        ),
+                        "options": run.options,
+                    },
+                )
             self.runtime.assistant_message(run_id, message)
             return self._turn(run_id, [message], options=run.options)
 
-        return self._execute_approval(run_id, proposal)
+        if proposal.action == Action.CANCEL:
+            return self._execute_cancel(run_id, proposal)
+        if proposal.action == Action.RESCHEDULE:
+            return self._execute_reschedule(run_id, proposal)
+        return self._execute_book(run_id, proposal)
 
     def _decline(self, run_id: str, proposal: Proposal) -> None:
         now = self.clock.now()
@@ -419,8 +805,9 @@ class Conversation:
             if approval is not None and approval.state == ApprovalState.RECORDED:
                 self.store.update_approval_state(approval.id, ApprovalState.VOIDED, now)
             self.store.update_proposal_state(proposal.id, ProposalState.VOIDED, now)
-        self.world.release_hold(proposal.hold_id)
-        self.store.update_hold_state(proposal.hold_id, "released")
+        if proposal.hold_id is not None:
+            self.world.release_hold(proposal.hold_id)
+            self.store.update_hold_state(proposal.hold_id, "released")
         self.runtime.transition(run_id, RunState.OPTIONS_READY, reason="approval declined")
 
     def _rehold_after_invalidation(
@@ -466,7 +853,7 @@ class Conversation:
             supersedes=old_proposal,
         )
 
-    def _execute_approval(self, run_id: str, proposal: Proposal) -> TurnResult:
+    def _execute_book(self, run_id: str, proposal: Proposal) -> TurnResult:
         run = self.store.require_run(run_id)
         try:
             approval = record_approval(
@@ -516,9 +903,11 @@ class Conversation:
             return self._turn(run_id, [message])
         except ExecutionInProgress as exc:
             message = self._draft(
-                run_id, "failed", {"reason": str(exc), "trace_path": run.trace_path}
+                run_id,
+                "recovery_parked",
+                {"reason": str(exc), "trace_path": run.trace_path},
             )
-            self.runtime.finish(run_id, RunState.NEEDS_HUMAN, message)
+            self.runtime.finish(run_id, RunState.FAILED, message)
             return self._turn(run_id, [message])
         except VerificationFailed as exc:
             message = self._draft(
@@ -545,6 +934,228 @@ class Conversation:
             {"booking_id": result.booking.id, "proposal_id": result.proposal.id},
         )
         return self._turn(run_id, [message], booking=result.booking)
+
+    def _execute_cancel(self, run_id: str, proposal: Proposal) -> TurnResult:
+        run = self.store.require_run(run_id)
+        try:
+            approval = record_approval(
+                self.store, self.runtime, self.clock, proposal.id, run.user_id
+            )
+            result = self.guard.execute_cancel(proposal.id, approval.id)
+        except ApprovalExpired:
+            message = self._draft(
+                run_id, "cancel_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        except ApprovalConsumed:
+            booking = self.store.get_booking_by_id(proposal.booking_id or "")
+            if booking is not None and booking.status == "cancelled":
+                message = self._draft(
+                    run_id,
+                    "cancelled",
+                    {"booking": booking, "trace_path": run.trace_path},
+                )
+                self.runtime.finish(
+                    run_id,
+                    RunState.CANCELLED,
+                    message,
+                    {"booking_id": booking.id, "proposal_id": proposal.id},
+                )
+                return self._turn(run_id, [message], booking=booking)
+            message = self._draft(
+                run_id, "cancel_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        except ApprovalRequired:
+            message = self._draft(run_id, "approval_required", {"trace_path": run.trace_path})
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message])
+        except ApprovalInvalid:
+            message = self._draft(
+                run_id, "cancel_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        except ExecutionInProgress:
+            message = self._draft(
+                run_id, "recovery_parked", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        except VerificationFailed:
+            message = self._draft(
+                run_id, "recovery_parked", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.NEEDS_HUMAN, message)
+            return self._turn(run_id, [message])
+        except CancelFailed:
+            message = self._draft(
+                run_id, "cancel_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+
+        if result.booking is None:
+            message = self._draft(
+                run_id, "cancel_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        message = self._draft(
+            run_id,
+            "cancelled",
+            {"booking": result.booking, "trace_path": run.trace_path},
+        )
+        self.runtime.finish(
+            run_id,
+            RunState.CANCELLED,
+            message,
+            {"booking_id": result.booking.id, "proposal_id": result.proposal.id},
+        )
+        return self._turn(run_id, [message], booking=result.booking)
+
+    def _execute_reschedule(self, run_id: str, proposal: Proposal) -> TurnResult:
+        run = self.store.require_run(run_id)
+        try:
+            approval = record_approval(
+                self.store, self.runtime, self.clock, proposal.id, run.user_id
+            )
+            result = self.guard.execute_reschedule(proposal.id, approval.id)
+        except RescheduleConflict as exc:
+            return self._repropose_after_conflict(run_id, proposal, exc)
+        except ApprovalExpired:
+            message = self._draft(
+                run_id, "reschedule_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        except ApprovalConsumed:
+            booking = self.store.get_booking_by_id(proposal.booking_id or "")
+            if booking is not None and booking.slot_start == proposal.slot_start:
+                message = self._draft(
+                    run_id,
+                    "rescheduled",
+                    {"booking": booking, "trace_path": run.trace_path},
+                )
+                self.runtime.finish(
+                    run_id,
+                    RunState.COMPLETED,
+                    message,
+                    {"booking_id": booking.id, "proposal_id": proposal.id},
+                )
+                return self._turn(run_id, [message], booking=booking)
+            message = self._draft(
+                run_id, "reschedule_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        except ApprovalRequired:
+            message = self._draft(run_id, "approval_required", {"trace_path": run.trace_path})
+            self.runtime.assistant_message(run_id, message)
+            return self._turn(run_id, [message])
+        except ApprovalInvalid:
+            message = self._draft(
+                run_id, "reschedule_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        except ExecutionInProgress:
+            message = self._draft(
+                run_id, "recovery_parked", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        except VerificationFailed:
+            message = self._draft(
+                run_id, "recovery_parked", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.NEEDS_HUMAN, message)
+            return self._turn(run_id, [message])
+        except ExecutionFailed:
+            message = self._draft(
+                run_id, "reschedule_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+
+        if result.booking is None:
+            message = self._draft(
+                run_id, "reschedule_failed", {"trace_path": run.trace_path}
+            )
+            self.runtime.finish(run_id, RunState.FAILED, message)
+            return self._turn(run_id, [message])
+        message = self._draft(
+            run_id,
+            "rescheduled",
+            {"booking": result.booking, "trace_path": run.trace_path},
+        )
+        self.runtime.finish(
+            run_id,
+            RunState.COMPLETED,
+            message,
+            {"booking_id": result.booking.id, "proposal_id": result.proposal.id},
+        )
+        return self._turn(run_id, [message], booking=result.booking)
+
+    # -- booking helpers ----------------------------------------------------
+
+    def _begin_booking_search(self, run_id: str, *, reason: str) -> None:
+        run = self.store.require_run(run_id)
+        if run.state == RunState.OPTIONS_READY:
+            self.runtime.transition(
+                run_id, RunState.COLLECTING, reason="restart booking selection"
+            )
+        self.runtime.transition(run_id, RunState.SEARCHING, reason=reason)
+
+    def _active_bookings(self, run_id: str, user_id: str) -> list[WorldBooking]:
+        bookings = self.toolbox.call(run_id, "list_bookings", user_id=user_id)
+        now = self.clock.now()
+        return sorted(
+            (
+                booking
+                for booking in bookings
+                if booking.status == "confirmed" and booking.slot_end > now
+            ),
+            key=lambda booking: booking.slot_start,
+        )
+
+    def _mirror_booking(self, booking: WorldBooking) -> BookingRecord:
+        existing = self.store.get_booking_by_id(booking.id)
+        if existing is None:
+            existing = self.store.get_booking_by_key(booking.idempotency_key)
+        if existing is not None:
+            return existing
+        return self.store.create_booking(
+            BookingRecord(
+                id=booking.id,
+                user_id=booking.user_id,
+                proposal_id=None,
+                provider_id=booking.provider_id,
+                provider_name=booking.provider_name,
+                slot_start=booking.slot_start,
+                slot_end=booking.slot_end,
+                price_inr=booking.price_inr,
+                status=booking.status,
+                idempotency_key=booking.idempotency_key,
+                created_at=self.clock.now(),
+            )
+        )
+
+    def _select_booking(self, text: str, bookings: list[WorldBooking]) -> int | None:
+        if len(bookings) == 1:
+            normalized = text.strip().lower()
+            if not normalized or parse_option_selection(text, 1) in (0, None):
+                return 0
+        index = parse_option_selection(text, len(bookings))
+        if index is not None:
+            return index
+        normalized = text.strip().lower()
+        for position, booking in enumerate(bookings):
+            if normalized in {booking.id.lower(), booking.provider_id.lower()}:
+                return position
+        return None
 
     # -- helpers ------------------------------------------------------------
 

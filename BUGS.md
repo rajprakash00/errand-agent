@@ -41,3 +41,23 @@ canonicalises timestamps to whole seconds.
 **Regression:** `tests/test_approval_invalidation.py::test_approval_survives_sub_second_clock_precision`
 sets a microsecond clock and asserts the first confirmation completes with one
 booking.
+
+## 3. The reschedule demo seeded a provider with no replacement slot
+
+**Found:** while running `uv run errand demo --scenario reschedule-conflict`
+during ticket 04.
+
+**Symptom:** After the configured slot conflict, the agent replied "I couldn't
+find another free slot with that provider for this week" and parked the run at
+`needs_human`. The demo never showed the required second slot and approval.
+
+**Cause:** `seed_demo_booking` picked the top-rated provider, PipeMasters, which
+has only two slots in the search window. The demo booked one and proposed the
+other. The configured conflict then left no replacement slot.
+
+**Fix:** The demo seeds a provider with the most free slots in the window, so a
+replacement slot remains after the conflict.
+
+**Regression:** `tests/test_cli.py::test_demo_reschedule_conflict_reapproves_and_reschedules`
+asserts two approval cards, one `slot_conflict` reconciliation, and exactly one
+successful reschedule.

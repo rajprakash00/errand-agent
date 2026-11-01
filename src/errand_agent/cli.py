@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from errand_agent.clock import IST, Clock, FakeClock, SystemClock
@@ -18,7 +18,7 @@ from errand_agent.models import RequiredSlot, RunState, TurnResult
 from errand_agent.runtime import Runtime
 from errand_agent.toolbox import Toolbox
 from errand_agent.trace import Tracer
-from errand_agent.world import HOLD_MINUTES, MockProviderWorld
+from errand_agent.world import HOLD_MINUTES, MockProviderWorld, ProcessCrash
 
 
 @dataclass
@@ -77,11 +77,64 @@ def print_turn(user_text: str, turn: TurnResult) -> None:
     print(f"[state: {turn.state.value}]")
 
 
+def restart_app(app: App, data_dir: str | Path, user_id: str) -> App:
+    """Rebuild the kernel over the same database, as a process restart would.
+
+    The mock provider world stays alive because it models an external provider;
+    the agent's store, runtime, guard, and conversation are rebuilt.
+    """
+    app.store.close()
+    path = Path(data_dir)
+    store = Store(path / "errand.db")
+    tracer = Tracer(path / "traces", store, app.clock)
+    runtime = Runtime(store, tracer, app.clock)
+    toolbox = Toolbox(app.world, tracer, app.clock)
+    guard = ExecutionGuard(store, toolbox, runtime, app.clock)
+    conversation = Conversation(
+        store,
+        app.world,
+        tracer,
+        app.clock,
+        ScriptedModel(),
+        runtime=runtime,
+        toolbox=toolbox,
+        guard=guard,
+    )
+    return App(
+        store=store,
+        world=app.world,
+        tracer=tracer,
+        conversation=conversation,
+        clock=app.clock,
+    )
+
+
+def seed_demo_booking(app: App, user_id: str) -> None:
+    """Seed one future booking for the cancel and reschedule demos."""
+    now = app.clock.now()
+    results = app.world.search_providers(
+        "plumber", "Indiranagar", (now, now + timedelta(days=7))
+    )
+    if not results:
+        raise RuntimeError("no provider slots are available to seed a booking")
+    # Prefer a provider with spare slots so the reschedule-conflict demo has a
+    # replacement to offer after the configured conflict.
+    first = max(results, key=lambda result: len(result.free_slots))
+    slot = first.free_slots[0]
+    app.world.seed_booking(first.provider_id, slot, user_id=user_id)
+    print(
+        f"\n[demo] Seeded an existing booking: {first.name} — "
+        f"{format_slot_range(slot, slot + timedelta(minutes=60))}."
+    )
+
+
 def apply_demo_fault(app: App, scenario: str, turn: TurnResult, clock: FakeClock | None) -> None:
     """Inject the deterministic fault for a demo scenario after the approval card."""
     assert turn.approval is not None
     proposal = app.store.require_proposal(turn.approval.proposal_id)
     if scenario == "quote-change":
+        if proposal.hold_id is None:
+            raise RuntimeError("the quote-change scenario needs a booking hold")
         new_price = proposal.quoted_price_inr + 100
         app.world.requote_hold(proposal.hold_id, price_inr=new_price)
         print(
@@ -89,6 +142,8 @@ def apply_demo_fault(app: App, scenario: str, turn: TurnResult, clock: FakeClock
             f"{format_price(proposal.quoted_price_inr)} -> {format_price(new_price)}."
         )
     elif scenario == "slot-change":
+        if proposal.hold_id is None:
+            raise RuntimeError("the slot-change scenario needs a booking hold")
         run = app.store.require_run(turn.run_id)
         option = next(item for item in run.options if item.provider_id == proposal.provider_id)
         new_start = next(slot for slot in option.free_slots if slot != proposal.slot_start)
@@ -104,18 +159,56 @@ def apply_demo_fault(app: App, scenario: str, turn: TurnResult, clock: FakeClock
             raise RuntimeError("the hold-expiry scenario needs the fake clock")
         clock.advance(minutes=HOLD_MINUTES + 1)
         print("\n[scenario] Time passes beyond the 10-minute hold expiry.")
+    elif scenario == "timeout-after-success":
+        app.world.fail_next_book(committed=True)
+        print("\n[scenario] The booking call times out after the provider committed.")
+    elif scenario == "timeout-before-success":
+        app.world.fail_next_book(committed=False)
+        print("\n[scenario] The booking call times out before the provider committed.")
+    elif scenario == "restart-mid-booking":
+        app.world.crash_next_book(committed=False)
+        print("\n[scenario] The agent process will die mid-booking.")
+    elif scenario == "reschedule-conflict":
+        app.world.configure_reschedule_conflict(proposal.provider_id, proposal.slot_start)
+        print(
+            "\n[scenario] The provider will reject the approved slot "
+            f"{format_slot_range(proposal.slot_start, proposal.slot_end)}."
+        )
     else:
         raise ValueError(f"unknown demo scenario: {scenario}")
 
 
+FAULT_SCENARIOS = frozenset(
+    {
+        "quote-change",
+        "slot-change",
+        "hold-expiry",
+        "timeout-after-success",
+        "timeout-before-success",
+        "restart-mid-booking",
+        "reschedule-conflict",
+    }
+)
+
+
 def run_demo(args: argparse.Namespace) -> int:
-    demo_clock = FakeClock(datetime.now(IST)) if args.scenario == "hold-expiry" else None
+    needs_clock = args.scenario in {"hold-expiry"}
+    demo_clock = FakeClock(datetime.now(IST)) if needs_clock else None
     app = build_app(args.data_dir, user_id=args.user_id, clock=demo_clock)
     try:
         print("Errand Agent — scripted demo")
         print(f"Scenario: {args.scenario}")
         print(f"User: {args.user_id}")
-        first = "I need a plumber to fix a leaking tap this week."
+
+        if args.scenario in {"cancel", "reschedule-conflict"}:
+            seed_demo_booking(app, args.user_id)
+
+        if args.scenario == "cancel":
+            first = "Cancel my booking."
+        elif args.scenario == "reschedule-conflict":
+            first = "Move my booking to this week."
+        else:
+            first = "I need a plumber to fix a leaking tap this week."
         turn = app.conversation.start_run(args.user_id, first)
         print_turn(first, turn)
 
@@ -124,7 +217,7 @@ def run_demo(args: argparse.Namespace) -> int:
             RequiredSlot.AREA: "Indiranagar",
             RequiredSlot.TIME_WINDOW: "this week",
         }
-        injected = args.scenario == "happy"
+        injected = args.scenario not in FAULT_SCENARIOS
         for _ in range(12):
             if turn.terminal:
                 break
@@ -139,14 +232,29 @@ def run_demo(args: argparse.Namespace) -> int:
                 reply = "2" if len(turn.options) >= 2 else "1"
             else:
                 break
-            turn = app.conversation.send_message(turn.run_id, reply)
+            try:
+                turn = app.conversation.send_message(turn.run_id, reply)
+            except ProcessCrash:
+                print("\n[scenario] The agent process died mid-booking.")
+                app = restart_app(app, args.data_dir, args.user_id)
+                recovered = app.conversation.recover_pending()
+                for recovered_turn in recovered:
+                    print_turn("(recovered after restart)", recovered_turn)
+                if not recovered:
+                    raise
+                turn = recovered[-1]
+                continue
             print_turn(reply, turn)
 
-        bookings = app.store.list_bookings(args.user_id)
-        print(f"\nBookings recorded: {len(bookings)}")
+        active = [
+            booking
+            for booking in app.store.list_bookings(args.user_id)
+            if booking.status == "confirmed"
+        ]
+        print(f"\nBookings recorded: {len(active)}")
         print(f"Final state: {turn.state.value}")
         print(f"Trace: {turn.trace_path}")
-        return 0 if turn.state == RunState.COMPLETED else 1
+        return 0 if turn.state in (RunState.COMPLETED, RunState.CANCELLED) else 1
     finally:
         app.close()
 
@@ -154,6 +262,8 @@ def run_demo(args: argparse.Namespace) -> int:
 def run_chat(args: argparse.Namespace) -> int:
     app = build_app(args.data_dir, user_id=args.user_id)
     try:
+        for recovered in app.conversation.recover_pending():
+            print_turn("(recovered after restart)", recovered)
         print("Errand Agent. Type /quit to exit and /trace to see the trace path.")
         first = input("You: ").strip()
         if not first:
@@ -190,7 +300,17 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--user-id", default="user_raj")
     demo.add_argument(
         "--scenario",
-        choices=("happy", "quote-change", "slot-change", "hold-expiry"),
+        choices=(
+            "happy",
+            "quote-change",
+            "slot-change",
+            "hold-expiry",
+            "timeout-after-success",
+            "timeout-before-success",
+            "restart-mid-booking",
+            "cancel",
+            "reschedule-conflict",
+        ),
         default="happy",
         help="fault to inject after the first approval card",
     )
