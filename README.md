@@ -1,17 +1,29 @@
 # Errand Agent
 
-A local, offline errand booking agent with a code-enforced approval kernel.
+[![CI](https://github.com/rajprakash00/errand-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/rajprakash00/errand-agent/actions/workflows/ci.yml)
 
-This repository currently implements tickets 01–11: a scripted CLI errand from
-the first request to a verified booking, approval invalidation and hold expiry,
-timeout reconciliation with restart recovery, cancel/reschedule, untrusted
-review handling with injection defense, bounded execution with clear exits,
-memory with provenance and tombstones, a browser chat with a live trace, a
-memory panel in the same UI, an offline eval harness with 20 scenarios and a
-generated table, and an in-browser demo panel with a committed trace artifact.
-Everything uses SQLite persistence and a JSONL trace.
+A local, offline errand booking agent with a code-enforced approval kernel. The
+model proposes; the kernel disposes.
 
-## Run
+- The dialogue machine asks only for the missing required slot, searches six
+  seeded providers, holds one slot, and presents an exact approval card.
+- `book`, `cancel`, and `reschedule` are reachable only through the execution
+  guard. It binds the approval to the user, action, booking, provider, slot,
+  price, quote version, hold, and expiry.
+- A provider, slot, price, or expiry change voids the approval. An expired hold
+  is re-held and re-approved before anything is booked.
+- A timeout is `unknown`, not failed. The guard checks `get_booking_status` with
+  the same idempotency key and verifies with `list_bookings` before it reports
+  success. Restart recovery reuses the original key.
+- Reviews are sanitised and shown as untrusted quotes. The model's tool surface
+  is read-only, so a review cannot hold, book, cancel, reschedule, or approve.
+- Memory keeps stated and inferred provenance, pending confirmation,
+  corrections, and tombstones.
+- Every run has hard caps: 12 model turns, 30 tool calls, 15 minutes wall clock,
+  and 90 seconds per turn. Exhaustion ends clearly at `limit_reached`.
+- Every run writes an append-only JSONL trace plus an indexed copy in SQLite.
+
+## Quick start
 
 ```bash
 uv sync
@@ -19,179 +31,87 @@ uv run errand demo
 uv run pytest
 ```
 
-The demo asks for the missing area, shows six plumbers in Indiranagar, holds the
-earliest slot for the chosen provider, prints the exact approval card, and books
-only after the typed `yes`. It prints the final run state and the trace path.
+The demo completes one verified booking: it asks for the missing area, shows six
+plumbers in Indiranagar, holds the earliest slot, prints the exact approval, and
+books. It prints the final state and trace path. No API key or external service
+is used.
 
-## Evals
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `uv run errand demo` | Scripted booking in the terminal. |
+| `uv run errand demo --scenario NAME` | Same flow with a deterministic fault. |
+| `uv run errand chat` | Interactive terminal chat. |
+| `uv run errand serve` | Browser chat with a live trace pane. |
+| `uv run errand evals` | 20 offline scenarios; writes `EVALS.md`. |
+| `uv run errand memory list` | List saved facts. |
+
+Memory edits use the same fact store as chat and the browser:
 
 ```bash
-uv run errand evals
+uv run errand memory remember area Indiranagar
+uv run errand memory correct area Koramangala
+uv run errand memory confirm earliest_time
+uv run errand memory forget area
+uv run errand memory list --all
 ```
 
-This runs 20 offline scenarios with a fresh temporary SQLite database, a
-scripted user, the scripted model, a fixed clock, and a deterministic fault plan
-per scenario. The harness asserts outcomes and invariants from the store, the
-mock tool log, and the trace; it does not assert reply wording. It writes the
-generated [`EVALS.md`](EVALS.md) table and exits non-zero if a scenario or a
-global invariant fails.
+## Failure scenarios
 
-## Web UI
+Each scenario injects its fault at the approval boundary. The model cannot arm
+it.
+
+| Scenario | Behavior |
+|---|---|
+| `quote-change` | The provider re-quotes; the old approval is void; a new card appears. |
+| `slot-change` | The provider moves the slot; the old approval is void; a new card appears. |
+| `hold-expiry` | The hold expires; the same slot is re-held; a new approval is required. |
+| `timeout-after-success` | The provider commits, then times out; status says `booked`; one booking. |
+| `timeout-before-success` | Status says `not_found`; the same key is retried; one booking. |
+| `restart-mid-booking` | The process dies after the intent write; restart recovery finishes it; one booking. |
+| `cancel` | The first cancel gets a transient 503; the same key is retried; cancellation is verified. |
+| `reschedule-conflict` | The approved slot is rejected; a new slot and approval appear; the booking moves once. |
+| `injection` | A hostile review is shown as an untrusted quote and cannot act. |
+| `limit-turns` | The turn cap ends the run at `limit_reached` with no booking. |
+| `unknown-error` | An unexpected search error ends at `failed` with no stack trace. |
+| `memory` | Shows stated, inferred pending, confirmed, corrected, and forgotten facts. |
+
+## Browser UI
 
 ```bash
 uv run errand serve
 ```
 
-Open <http://127.0.0.1:8000>. The chat sits on the left and the live trace on
-the right; both stay side by side at 1280 px. The approval card shows the exact
-action, provider, slot, price, and hold expiry. The trace pane streams state
+Open <http://127.0.0.1:8000>. The chat is on the left and the live trace on the
+right; both stay side by side at 1280 px. The approval card shows the action,
+provider, slot, price, hold expiry, and binding hash. The trace streams state
 transitions, model calls, tool calls, approvals, status checks, and
-reconciliation as they happen, and the download button returns the raw JSONL
-file for the run.
+reconciliation. The download button returns the raw JSONL file.
 
-The web UI calls the same conversation seam as the CLI. It uses the same
-approval path: the card's buttons send the same `yes` or `no` decision that the
-typed parser receives.
+The **Memory** button opens the memory panel: view facts with their source and
+status, confirm a pending inference, correct a value, or forget a fact. The
+panel writes the same records and trace events as the CLI and chat.
 
-The **Memory** button in the top bar opens the memory panel. It lists every
-saved fact with its source (`You said` or `Inferred`) and status. An inferred
-fact is highlighted as pending and is not used by a search. **Confirm** applies
-it, **Correct** replaces the value and archives the old one, and **Forget**
-deletes the value and writes the same tombstone as the CLI or chat path. The
-panel and the chat share one per-user fact store, so a correction or a
-confirmation changes the next search.
-
-To see the full panel flow, chat `Remember that I live in Indiranagar`, start a
-plumber errand, then reply `I usually book the early slots`. Open **Memory**:
-the area is stated and active, the time is inferred and pending. Confirm the
-time, correct the area, then start a new errand without naming an area but with
-a day, for example `I need a plumber this week`. The next search uses the
-corrected area and the confirmed earliest time. Forget the area and a new
-session asks for it again.
-
-To demonstrate reconciliation in the browser, start the server with the
-timeout-after-success fault:
+The **Demo** button arms a failure scenario without restarting the server.
+`--scenario NAME` arms one at startup:
 
 ```bash
 uv run errand serve --scenario timeout-after-success
 ```
 
-Complete the booking in the side-by-side layout. The trace shows the timeout,
-the `get_booking_status` check, the reconciliation event, and the verified
-booking. The scenario is injected at the approval boundary, so the first
-approval card is genuine.
-
-The **Demo** button in the top bar opens the same fault controls without
-restarting the server. It lists the armable scenarios, including
-timeout-after-success, injected review, hold expiry, slot conflict, and restart
-mid-booking. Each card has **Arm** and **Arm & start**; the first arms the
-scenario, the second clears the current run and starts the scenario's prompt. The
-scenario strip above the chat states what will happen. Faults are still injected
-by the kernel at the approval boundary, never by the model. The restart control
-rebuilds the kernel over the same SQLite database and recovers the in-flight
-intent in the same browser request; the trace shows the crash, the restart
-reconciliation, and the verified booking.
-
-`--scenario` remains available for a scripted startup, so the same fault can be
-armed before the page opens:
-
-```bash
-uv run errand serve --scenario hold-expiry
-```
-
 Use `--host`, `--port`, and `--data-dir` to change the listener or the SQLite
-location. The server binds `127.0.0.1` by default and makes no external calls.
-The UI bundles Inter and Instrument Serif under the SIL Open Font License; their
-licenses are in `src/errand_agent/static/fonts/LICENSES.md`.
+location. The server binds `127.0.0.1` and makes no external calls. The bundled
+Inter and Instrument Serif fonts are under the SIL Open Font License; see
+`src/errand_agent/static/fonts/LICENSES.md`.
 
-Use `--scenario` with the demo command to see an approval being invalidated and replaced:
+## Trace and evals
 
-```bash
-uv run errand demo --scenario quote-change
-uv run errand demo --scenario slot-change
-uv run errand demo --scenario hold-expiry
-```
-
-Each scenario injects the fault after the first approval card. The old approval
-is refused, a fresh hold and quote produce a new approval card, and the second
-`yes` creates exactly one booking.
-
-Timeout and restart scenarios:
-
-```bash
-uv run errand demo --scenario timeout-after-success
-uv run errand demo --scenario timeout-before-success
-uv run errand demo --scenario restart-mid-booking
-```
-
-A timeout is treated as an unknown outcome. The agent checks
-`get_booking_status` with the same idempotency key before any retry. The restart
-scenario kills the agent between the intent write and the booking result, then
-rebuilds the kernel over the same database and recovers the in-flight intent.
-Each run creates exactly one booking.
-
-Cancel and reschedule scenarios:
-
-```bash
-uv run errand demo --scenario cancel
-uv run errand demo --scenario reschedule-conflict
-```
-
-The cancel demo seeds one existing booking. The first `cancel` call gets a
-transient 503; the agent retries with the same key and verifies the booking is
-gone. The reschedule demo seeds a booking, rejects the first approved slot, and
-shows a second slot with a new approval before the booking moves.
-
-Review injection and bounded-execution scenarios:
-
-```bash
-uv run errand demo --scenario injection
-uv run errand demo --scenario limit-turns
-uv run errand demo --scenario unknown-error
-```
-
-Reviews are displayed as untrusted quotes. A review that says "ignore previous
-instructions" is shown with the `untrusted` label but cannot change the proposal,
-hold a slot, book, or write an approval. The model's tool surface exposes only
-read tools; `hold_slot`, `book`, `cancel`, `reschedule`, and the approval write
-path fail closed. The `injection` demo shows the seeded hostile review, then
-books only the quoted provider after the typed approval.
-
-Every run has hard caps: 12 model turns, 30 tool calls, 15 minutes wall clock,
-and 90 seconds per turn. The counters are persisted in SQLite. `limit-turns`
-forces the turn cap and ends at `limit_reached` with the trace ID and a
-statement that no booking was made. `unknown-error` forces an unexpected search
-failure and ends at `failed` with a clear message and no stack trace.
-
-Use `uv run errand chat` for an interactive session. The chat startup resolves
-any intents a previous process left in flight. In the options step, ask for
-`reviews for 2` (Ravi Plumbing Works) to see the seeded injected review.
-
-Memory scenarios and commands:
-
-```bash
-uv run errand demo --scenario memory
-uv run errand memory list
-uv run errand memory remember area Indiranagar
-uv run errand memory correct area Koramangala
-uv run errand memory confirm earliest_time
-uv run errand memory forget area
-```
-
-The memory demo saves an area in session one, uses it in session two without
-asking, shows a hedged "mornings" preference as inferred and pending, proves
-that the pending fact is not used, confirms it, forgets the area, and starts a
-fresh session that asks for the area again. Replaying the old chat message does
-not restore the forgotten area. `memory list --all` also shows tombstones.
-
-## Committed trace
-
-The repository includes a raw timeout-after-success run at
-[`artifacts/traces/timeout-after-success.jsonl`](artifacts/traces/timeout-after-success.jsonl)
-and a short annotated excerpt at
+The committed timeout-after-success run is
+[`artifacts/traces/timeout-after-success.jsonl`](artifacts/traces/timeout-after-success.jsonl),
+with an annotated excerpt at
 [`artifacts/traces/timeout-after-success.md`](artifacts/traces/timeout-after-success.md).
-The excerpt uses sequence numbers as the join key, so every annotation can be
-checked against the raw line. Regenerate both the event sequence and the file
+The excerpt uses `seq` as the join key to the raw lines. Regenerate the trace
 with:
 
 ```bash
@@ -199,58 +119,24 @@ uv run errand demo --scenario timeout-after-success \
   --trace-out artifacts/traces/timeout-after-success.jsonl
 ```
 
-The recording command uses a fresh database and a fixed clock. The trace shows
-one `book` call that times out after the provider committed, the
-`get_booking_status` check with the same idempotency key, the `booked`
-reconciliation, and the final verified state. A test compares the committed
-event and tool sequence with a fresh recording.
+The run shows one `book` call that times out after the provider committed, the
+`get_booking_status` check with the same key, the `booked` reconciliation, and
+the final verified state.
 
-## What is enforced
+`uv run errand evals` runs 20 scenarios with a fresh temporary database, a fixed
+clock, a scripted user, the scripted model, and a deterministic fault plan. It
+asserts outcomes, records, tool calls, and trace events, plus six global
+invariants. It writes the generated [`EVALS.md`](EVALS.md) and exits non-zero on
+failure.
 
-- The proposal is immutable and hashed over `user_id`, `action`, `booking_id`,
-  `provider_id`, `slot_start`, `slot_end`, `quoted_price_inr`, `quote_version`,
-  `hold_id`, and `expires_at`.
-- `book` is reachable only through the execution guard. The guard requires a
-  recorded, unconsumed approval whose hash matches the proposal and whose hold
-  has not expired.
-- The guard writes an intent and consumes the approval in one SQLite
-  transaction, then calls the mock provider and verifies the result with
-  `get_booking_status` before reporting success.
-- Before execution the guard compares the approved proposal with the provider's
-  live hold. A changed provider, slot, price, quote version, or expiry voids the
-  approval and requires a new one.
-- An expired hold cannot be booked. The agent releases it, re-holds the same
-  slot, shows the new quote, and asks for approval again.
-- A repeated `yes` after a completed booking returns the existing booking. It
-  never calls `book` again or writes a second approval.
-- A booking timeout is `unknown`, not failed. The guard checks
-  `get_booking_status` with the same key, retries once only if the status is
-  `not_found`, and verifies with `list_bookings` before claiming success.
-- On startup, in-flight and unknown intents are reconciled from the provider's
-  status before anything else happens. A recovery retry reuses the original
-  idempotency key, so a restart cannot create a second booking.
-- Cancel is verified with `list_bookings`, and a transient 503 is retried with
-  the same idempotency key. Cancel binds the action, booking, provider, slot,
-  and ₹0 price in the same approval hash as a booking.
-- A reschedule conflict voids the consumed approval, keeps the booking
-  unchanged, and produces a new hold, slot, price, and approval. The booking
-  moves only after the second approval.
-- Provider reviews are sanitised, bounded, labelled untrusted, and rendered as
-  quotes. The review text is not part of the proposal or approval path. The
-  model's tool surface is read-only, so a model that follows an injection still
-  cannot hold, book, cancel, reschedule, or write an approval.
-- Turn, tool, wall-clock, and per-turn caps are checked before each step and
-  persisted per run. Exhaustion ends at `limit_reached` with the trace ID and a
-  no-booking statement. Unexpected errors end at `failed` with a clear message
-  and no stack trace. Both write a final `run_finished` trace event.
-- Memory is keyed by user, not by run. Only the deterministic parser creates a
-  `stated` fact. A hedged model suggestion is `inferred` and starts as
-  `pending_confirmation`; the search does not use it until the user confirms.
-  Corrections archive the old value. Forget deletes the value, marks the fact
-  `forgotten`, and writes a tombstone hash. A replayed old message cannot
-  resurrect it, and a new session never reads it. The browser memory panel calls
-  the same conversation methods, so its correct, confirm, and forget actions
-  write the same records and trace events as the chat and CLI paths.
-- Every run writes a JSONL trace plus an indexed copy of the events in SQLite.
-  Timeout runs show `book` error → `get_booking_status` → `reconciliation` →
-  `run_finished`.
+## Docs
+
+- [`DESIGN.md`](DESIGN.md) — architecture, approval kernel, recovery, evidence,
+  and the 100× analysis.
+- [`ASSUMPTIONS.md`](ASSUMPTIONS.md) — locked assignment readings and
+  implementation choices.
+- [`EVALS.md`](EVALS.md) — generated eval table.
+- [`BUGS.md`](BUGS.md) — real bugs, each with a regression test.
+- [`LICENSE`](LICENSE) — MIT.
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — ruff, pytest, evals,
+  and a check that `EVALS.md` is current.

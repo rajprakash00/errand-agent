@@ -2,6 +2,8 @@
 name = "errand-agent"
 version = "0.1.0"
 description = "Offline, deterministic errand booking agent with a code-enforced approval kernel"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
@@ -12,6 +14,9 @@ dependencies = [
 
 [project.scripts]
 errand = "errand_agent.cli:main"
+
+[project.urls]
+Repository = "https://github.com/rajprakash00/errand-agent"
 
 [build-system]
 requires = ["hatchling"]
