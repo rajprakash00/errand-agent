@@ -5,6 +5,12 @@
 A local, offline errand booking agent with a code-enforced approval kernel. The
 model proposes; the kernel disposes.
 
+![The browser chat with the exact approval card and the live trace](artifacts/ui/approval.png)
+
+*The approval card binds the action, provider, slot, price, hold, and expiry.
+The live trace shows every model call, tool call, approval, and state transition
+beside the chat.*
+
 - The dialogue machine asks only for the missing required slot, searches six
   seeded providers, holds one slot, and presents an exact approval card.
 - `book`, `cancel`, and `reschedule` are reachable only through the execution
